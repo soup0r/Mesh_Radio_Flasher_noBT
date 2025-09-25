@@ -14,7 +14,7 @@
 #include "driver/gpio.h"
 #include "esp_mac.h"
 #include "nrf52_hal.h"
-#include "wifi_credentials.h"
+#include "config.h"
 #include "esp_http_server.h"
 #include "web_upload.h"
 #include "web_server.h"
@@ -933,9 +933,9 @@ static esp_err_t try_swd_connection(void) {
         ESP_LOGI(TAG, "Initializing SWD interface...");
         
         swd_config_t swd_cfg = {
-            .pin_swclk = 4,  // ESP32C3 GPIO4
-            .pin_swdio = 3,  // ESP32C3 GPIO3
-            .pin_reset = 5,  // ESP32C3 GPIO5
+            .pin_swclk = SWD_PIN_SWCLK,
+            .pin_swdio = SWD_PIN_SWDIO,
+            .pin_reset = SWD_PIN_RESET,
             .delay_cycles = 0
         };
         
@@ -1065,7 +1065,7 @@ static void init_system(void) {
     system_events = xEventGroupCreate();
     
     power_config_t power_cfg = {
-        .target_power_gpio = 10,
+        .target_power_gpio = TARGET_POWER_GPIO,
         .power_on_delay_ms = 100,
         .reset_hold_ms = 50,
         .sleep_duration_sec = sys_config.sleep_timeout_sec,

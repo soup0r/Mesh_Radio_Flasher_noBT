@@ -43,5 +43,5 @@ __pycache__/
 # ccache
 .ccache/
 
-# WiFi credentials - sensitive information
-wifi_credentials.h
+# Configuration file - sensitive information (WiFi credentials, etc.)
+config.h

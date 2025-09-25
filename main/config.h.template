@@ -1,0 +1,18 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// WiFi Configuration - UPDATE THESE VALUES
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+// Device Configuration
+#define DEVICE_NAME "Mesh Radio Flasher"
+#define DEVICE_VERSION "1.0.0"
+
+// Hardware Configuration - ESP32-C3 GPIO pins
+#define SWD_PIN_SWCLK 4
+#define SWD_PIN_SWDIO 3
+#define SWD_PIN_RESET 5
+#define TARGET_POWER_GPIO 10
+
+#endif
