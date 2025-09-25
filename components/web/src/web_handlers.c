@@ -7,15 +7,20 @@ static const char *TAG = "WEB_HANDLERS";
 
 // Power status handler
 static esp_err_t power_status_handler(httpd_req_t *req) {
+    // Use the internal state function
     bool is_powered = power_target_is_on();
-    ESP_LOGI(TAG, "Power status request: %s", is_powered ? "ON" : "OFF");
+
+    ESP_LOGI(TAG, "Power status request: %s (internal state)", is_powered ? "ON" : "OFF");
+
     cJSON *json = cJSON_CreateObject();
     cJSON_AddBoolToObject(json, "success", true);
     cJSON_AddBoolToObject(json, "powered", is_powered);
     cJSON_AddStringToObject(json, "status", is_powered ? "ON" : "OFF");
+
     char *json_string = cJSON_Print(json);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_string, strlen(json_string));
+
     free(json_string);
     cJSON_Delete(json);
     return ESP_OK;
@@ -58,17 +63,25 @@ static esp_err_t battery_status_handler(httpd_req_t *req) {
 
 // Power control handlers
 static esp_err_t power_on_handler(httpd_req_t *req) {
-    ESP_LOGI(TAG, "Power on request");
+    ESP_LOGI(TAG, "=== Power ON request received ===");
 
     esp_err_t ret = power_target_on();
+
+    // Always check state after operation using internal state
+    bool is_on = power_target_is_on();
+    ESP_LOGI(TAG, "State after operation: %s", is_on ? "ON" : "OFF");
 
     cJSON *json = cJSON_CreateObject();
     if (ret == ESP_OK) {
         cJSON_AddBoolToObject(json, "success", true);
         cJSON_AddStringToObject(json, "message", "Power turned on");
+        cJSON_AddBoolToObject(json, "powered", true);  // Add this
+        ESP_LOGI(TAG, "Power ON successful");
     } else {
         cJSON_AddBoolToObject(json, "success", false);
         cJSON_AddStringToObject(json, "message", "Failed to turn on power");
+        cJSON_AddBoolToObject(json, "powered", is_on);
+        ESP_LOGE(TAG, "Power ON failed!");
     }
 
     char *json_string = cJSON_Print(json);
@@ -81,17 +94,25 @@ static esp_err_t power_on_handler(httpd_req_t *req) {
 }
 
 static esp_err_t power_off_handler(httpd_req_t *req) {
-    ESP_LOGI(TAG, "Power off request");
+    ESP_LOGI(TAG, "=== Power OFF request received ===");
 
     esp_err_t ret = power_target_off();
+
+    // Always check state after operation using internal state
+    bool is_on = power_target_is_on();
+    ESP_LOGI(TAG, "State after operation: %s", is_on ? "ON" : "OFF");
 
     cJSON *json = cJSON_CreateObject();
     if (ret == ESP_OK) {
         cJSON_AddBoolToObject(json, "success", true);
         cJSON_AddStringToObject(json, "message", "Power turned off");
+        cJSON_AddBoolToObject(json, "powered", false);  // Add this
+        ESP_LOGI(TAG, "Power OFF successful");
     } else {
         cJSON_AddBoolToObject(json, "success", false);
         cJSON_AddStringToObject(json, "message", "Failed to turn off power");
+        cJSON_AddBoolToObject(json, "powered", is_on);
+        ESP_LOGE(TAG, "Power OFF failed!");
     }
 
     char *json_string = cJSON_Print(json);

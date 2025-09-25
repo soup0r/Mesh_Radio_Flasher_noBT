@@ -1,9 +1,16 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-// WiFi Configuration - UPDATE THESE VALUES
+// Primary WiFi Configuration (ESP-LR Access Point)
+#define WIFI_LR_ENABLED true
+#define WIFI_LR_SSID "ESP_LR_AP_NAME"
+#define WIFI_LR_PASSWORD "ESP_LR_PASSWORD"
+#define WIFI_LR_CONNECT_TIMEOUT_MS 15000  // 15 seconds for LR connection attempt
+
+// Fallback WiFi Configuration (Normal AP)
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_CONNECT_TIMEOUT_MS 10000  // 10 seconds for normal connection attempt
 
 // Device Configuration
 #define DEVICE_NAME "Mesh Radio Flasher"
@@ -13,6 +20,33 @@
 #define SWD_PIN_SWCLK 4
 #define SWD_PIN_SWDIO 3
 #define SWD_PIN_RESET 5
-#define TARGET_POWER_GPIO 10
+#define TARGET_POWER_GPIO 2  // MUST be RTC GPIO for deep sleep persistence (GPIO2 is RTC on ESP32-C3)
+
+// Battery Voltage Thresholds (in Volts)
+#define BATTERY_HIGH_THRESHOLD 4.1f
+#define BATTERY_MEDIUM_HIGH_THRESHOLD 3.8f
+#define BATTERY_LOW_THRESHOLD 3.6f
+#define BATTERY_CRITICAL_THRESHOLD 3.4f
+
+// Deep Sleep Intervals (in minutes, converted to microseconds in code)
+#define DEEP_SLEEP_HIGH_BATTERY_MIN 10     // 10 minutes when battery > 4.1V
+#define DEEP_SLEEP_MEDIUM_BATTERY_MIN 20   // 20 minutes when 3.8V < battery < 4.1V
+#define DEEP_SLEEP_LOW_BATTERY_MIN 30      // 30 minutes when battery < 3.8V
+#define DEEP_SLEEP_CRITICAL_HOURS 12       // 12 hours when battery < 3.4V
+
+// Power Management Settings
+#define NRF52_POWER_OFF_VOLTAGE 3.6f       // Turn off nRF52 when battery drops below this
+#define NRF52_POWER_OFF_HOURS 12           // Keep nRF52 off for 12 hours
+#define CRITICAL_SLEEP_VOLTAGE 3.4f        // Enter extended deep sleep below this voltage
+#define CRITICAL_SLEEP_HOURS 12            // Sleep for 12 hours in critical state
+
+// Deep Sleep Wake Check Settings
+#define WAKE_CHECK_RETRY_COUNT 2           // Number of WiFi connection attempts before returning to sleep
+#define WIFI_DISCONNECT_GRACE_MS 5000      // Wait time before entering sleep after WiFi disconnect
+
+// Enable/Disable Features
+#define ENABLE_DEEP_SLEEP_POWER_MGMT true  // Master switch for deep sleep functionality
+#define ENABLE_BATTERY_PROTECTION true      // Enable battery protection features
+#define LOG_BATTERY_STATS true             // Log battery statistics to console
 
 #endif

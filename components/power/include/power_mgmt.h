@@ -76,6 +76,18 @@ esp_err_t power_schedule_sleep(void);
 void power_cancel_sleep(void);
 bool power_should_stay_awake(void);
 
+// Enhanced adaptive deep sleep management
+esp_err_t power_enter_adaptive_deep_sleep(void);
+esp_err_t power_restore_from_deep_sleep(void);
+bool power_should_enter_deep_sleep(bool wifi_connected);
+uint64_t calculate_sleep_duration_us(float battery_voltage);
+
+// Helper functions for deep sleep management
+uint32_t power_get_wake_count(void);
+void power_reset_wake_count(void);
+uint64_t power_get_nrf_off_time_ms(void);
+bool power_is_nrf_power_off_active(void);
+
 // Wake reason
 typedef enum {
     WAKE_REASON_TIMER,
