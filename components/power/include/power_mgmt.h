@@ -133,4 +133,9 @@ const char* power_get_state_string(system_state_t state);
 float power_get_battery_voltage(void);
 float power_get_current_draw(void);
 
+// WiFi connection info functions
+void power_set_wifi_info(bool is_lr, const char* ssid);
+bool power_get_wifi_is_lr(void);
+const char* power_get_wifi_ssid(void);
+
 #endif // POWER_MGMT_H

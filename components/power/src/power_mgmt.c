@@ -1,6 +1,8 @@
 #include "power_mgmt.h"
+#include "config.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
+#include "esp_timer.h"
 #include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -11,27 +13,6 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
-
-// Configuration defines (if not from config.h)
-#ifndef BATTERY_HIGH_THRESHOLD
-#define BATTERY_HIGH_THRESHOLD 4.1f
-#define BATTERY_MEDIUM_HIGH_THRESHOLD 3.8f
-#define BATTERY_LOW_THRESHOLD 3.6f
-#define BATTERY_CRITICAL_THRESHOLD 3.4f
-#define DEEP_SLEEP_HIGH_BATTERY_MIN 10
-#define DEEP_SLEEP_MEDIUM_BATTERY_MIN 20
-#define DEEP_SLEEP_LOW_BATTERY_MIN 30
-#define DEEP_SLEEP_CRITICAL_HOURS 12
-#define NRF52_POWER_OFF_VOLTAGE 3.6f
-#define NRF52_POWER_OFF_HOURS 12
-#define CRITICAL_SLEEP_VOLTAGE 3.4f
-#define CRITICAL_SLEEP_HOURS 12
-#define WAKE_CHECK_RETRY_COUNT 2
-#define WIFI_DISCONNECT_GRACE_MS 5000
-#define ENABLE_DEEP_SLEEP_POWER_MGMT true
-#define ENABLE_BATTERY_PROTECTION true
-#define LOG_BATTERY_STATS true
-#endif
 
 static const char *TAG = "POWER_MGMT";
 static power_config_t power_config = {0};
@@ -52,8 +33,11 @@ RTC_DATA_ATTR static uint64_t rtc_last_sleep_us = 0;
 RTC_DATA_ATTR static bool rtc_nrf_power_off_active = false;
 
 // Regular variables for WiFi/sleep management
-static bool wifi_connected = false;
 static uint32_t wake_count = 0;
+
+// WiFi connection tracking
+static bool wifi_is_lr_mode = false;
+static char wifi_current_ssid[33] = {0};  // Max SSID length is 32 + null terminator
 
 #define VOLTAGE_DIVIDER_RATIO 2.0f
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_2
@@ -480,6 +464,23 @@ float power_get_current_draw(void) {
     return 0.0f;
 }
 
+// WiFi connection info functions
+void power_set_wifi_info(bool is_lr, const char* ssid) {
+    wifi_is_lr_mode = is_lr;
+    if (ssid) {
+        strncpy(wifi_current_ssid, ssid, sizeof(wifi_current_ssid) - 1);
+        wifi_current_ssid[sizeof(wifi_current_ssid) - 1] = '\0';
+    }
+}
+
+bool power_get_wifi_is_lr(void) {
+    return wifi_is_lr_mode;
+}
+
+const char* power_get_wifi_ssid(void) {
+    return wifi_current_ssid;
+}
+
 
 // Function to calculate deep sleep duration based on battery level
 uint64_t calculate_sleep_duration_us(float battery_voltage) {
@@ -518,9 +519,18 @@ esp_err_t power_enter_adaptive_deep_sleep(void) {
     power_get_battery_status(&battery);
     float voltage = battery.voltage;
 
+    // Increment for next wake with overflow protection
+    wake_count++;
+    if (wake_count > 1000) {  // Arbitrary safety limit
+        ESP_LOGW(TAG, "Wake count overflow protection - resetting to 0");
+        wake_count = 0;
+    }
+
+    ESP_LOGI(TAG, "Entering deep sleep (this will be wake #%lu)", wake_count);
+
     // Store values in RTC memory
     rtc_last_battery_voltage = voltage;
-    rtc_wake_count = ++wake_count;
+    rtc_wake_count = wake_count;
 
     // Calculate sleep duration
     uint64_t sleep_duration_us = calculate_sleep_duration_us(voltage);
@@ -577,6 +587,7 @@ esp_err_t power_enter_adaptive_deep_sleep(void) {
 
     ESP_LOGI(TAG, "Entering deep sleep for %llu seconds (wake count: %lu)",
             sleep_duration_us / 1000000ULL, wake_count);
+    ESP_LOGI(TAG, "DEBUG: Timer microseconds = %llu", sleep_duration_us);
 
     if (rtc_nrf_power_off_active) {
         ESP_LOGI(TAG, "nRF52 has been off for %llu ms total", rtc_nrf_off_total_ms);
@@ -584,6 +595,7 @@ esp_err_t power_enter_adaptive_deep_sleep(void) {
 
     // Configure wake up timer
     esp_sleep_enable_timer_wakeup(sleep_duration_us);
+    ESP_LOGI(TAG, "DEBUG: Timer configured, entering sleep NOW");
 
     // Enter deep sleep
     esp_deep_sleep_start();
@@ -608,11 +620,15 @@ esp_err_t power_restore_from_deep_sleep(void) {
         return ESP_OK;
     }
 
+    uint64_t actual_wake_time_us = esp_timer_get_time();
+
     ESP_LOGI(TAG, "=== Wake from Deep Sleep ===");
     ESP_LOGI(TAG, "Wake cause: %d", wake_cause);
     ESP_LOGI(TAG, "Wake count: %lu", rtc_wake_count);
     ESP_LOGI(TAG, "Last battery: %.2fV", rtc_last_battery_voltage);
-    ESP_LOGI(TAG, "Last sleep duration: %llu seconds", rtc_last_sleep_us / 1000000ULL);
+    ESP_LOGI(TAG, "Expected sleep: %llu seconds", rtc_last_sleep_us / 1000000ULL);
+    ESP_LOGI(TAG, "Actual wake time: %llu us since boot", actual_wake_time_us);
+    ESP_LOGI(TAG, "DEBUG: Configured sleep was %llu us", rtc_last_sleep_us);
     ESP_LOGI(TAG, "NRF52 state in RTC: %s", rtc_nrf_power_state ? "ON" : "OFF");
 
     // Update accumulated off time if nRF52 was powered off
@@ -700,34 +716,17 @@ bool power_should_enter_deep_sleep(bool wifi_connected_param) {
         return false;
     }
 
-    wifi_connected = wifi_connected_param;
-
-    if (wifi_connected) {
-        ESP_LOGI(TAG, "WiFi connected - staying awake");
-        wake_count = 0;
-        rtc_wake_count = 0;
-        return false;
-    }
-
+    // Only used for critical battery shutdown now
     battery_status_t battery;
     power_get_battery_status(&battery);
 
     if (battery.voltage < BATTERY_CRITICAL_THRESHOLD) {
-        ESP_LOGW(TAG, "Critical battery (%.2fV) - must sleep", battery.voltage);
+        ESP_LOGW(TAG, "Critical battery - must sleep");
         return true;
     }
 
-    if (wake_count >= WAKE_CHECK_RETRY_COUNT) {
-        ESP_LOGI(TAG, "Max wake attempts (%d) reached - entering deep sleep",
-                WAKE_CHECK_RETRY_COUNT);
-        wake_count = 0;
-        return true;
-    }
-
-    ESP_LOGI(TAG, "Wake attempt %lu/%d - will retry WiFi connection",
-            wake_count + 1, WAKE_CHECK_RETRY_COUNT);
-
-    return false;
+    // For normal operation, sleep is triggered by WiFi disconnect
+    return !wifi_connected_param;
 }
 
 // Helper functions
@@ -739,6 +738,7 @@ void power_reset_wake_count(void) {
     wake_count = 0;
     rtc_wake_count = 0;
 }
+
 
 // Get total nRF52 off time (for monitoring/debugging)
 uint64_t power_get_nrf_off_time_ms(void) {

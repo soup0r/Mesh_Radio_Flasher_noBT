@@ -78,8 +78,8 @@ static system_config_t sys_config = {
 
 // Global state
 static bool swd_initialized = false;
-static esp_timer_handle_t watchdog_timer = NULL;
-static esp_timer_handle_t sleep_timer = NULL;
+static esp_timer_handle_t watchdog_timer __attribute__((unused)) = NULL;
+static esp_timer_handle_t sleep_timer __attribute__((unused)) = NULL;
 static uint32_t error_count = 0;
 static uint32_t recovery_count = 0;
 
@@ -94,6 +94,7 @@ static esp_err_t try_swd_connection(void);
 static void handle_critical_error(const char *context, esp_err_t error);
 static void test_swd_functions(void);
 static void test_memory_regions(void);
+static void test_deep_sleep_command(void);
 static esp_err_t start_webserver(void);
 static void stop_webserver(void);
 static esp_err_t release_swd_handler(httpd_req_t *req);
@@ -178,9 +179,17 @@ static esp_err_t root_handler(httpd_req_t *req) {
     }
 
     // Part 2: Home tab with all status fields
-    char home_content[3072];
+    char home_content[4096];  // Increased size for WiFi status card
     snprintf(home_content, sizeof(home_content),
         "<div id='home' class='tab-pane active'>"
+        "<script>"
+        "setTimeout(function() {"
+        "  if (window.refreshStatus) refreshStatus();"
+        "  if (window.checkPowerStatus) checkPowerStatus();"
+        "  if (window.updateBatteryStatus) updateBatteryStatus();"
+        "  if (window.updateWiFiStatus) updateWiFiStatus();"
+        "}, 1000);"
+        "</script>"
         "<h2>System Overview</h2>"
         "<div class='info-grid'>"
         "<div class='info-card'>"
@@ -196,6 +205,16 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "<div class='info-item'><span class='info-label'>Status:</span><span class='info-value' id='battery-status'>Checking...</span></div>"
         "<div class='info-item'><span class='info-label'>Min/Max:</span><span class='info-value' id='battery-range'>Checking...</span></div>"
         "<div class='info-item'><span class='info-label'>Average:</span><span class='info-value' id='battery-avg'>Checking...</span></div>"
+        "</div>"
+        "<div class='info-card'>"
+        "<h3>📶 WiFi Status</h3>"
+        "<div class='info-item'><span class='info-label'>Connection:</span><span class='info-value' id='wifi-mode'>Checking...</span></div>"
+        "<div class='info-item'><span class='info-label'>SSID:</span><span class='info-value' id='wifi-ssid'>Checking...</span></div>"
+        "<div class='info-item'><span class='info-label'>Signal:</span><span class='info-value' id='wifi-rssi'>Checking...</span></div>"
+        "<div class='info-item'><span class='info-label'>Quality:</span><span class='info-value' id='wifi-quality'>Checking...</span></div>"
+        "<div class='info-item'><span class='info-label'>Channel:</span><span class='info-value' id='wifi-channel'>Checking...</span></div>"
+        "<div class='info-item'><span class='info-label'>PHY Mode:</span><span class='info-value' id='wifi-phy'>Checking...</span></div>"
+        "<div class='info-item'><span class='info-label'>Gateway:</span><span class='info-value' id='wifi-gateway'>Checking...</span></div>"
         "</div>"
         "<div class='info-card'>"
         "<h3>Target Radio</h3>"
@@ -302,9 +321,7 @@ static esp_err_t root_handler(httpd_req_t *req) {
     const char* js_start =
         "</div></div>"
         "<script>"
-        "console.log('=== SCRIPT START ===');"
         "let progressTimer = null;"
-        "console.log('progressTimer declared');"
         ""
         "function openTab(evt, tabName) {"
         "  var i, tabcontent, tabs;"
@@ -320,6 +337,9 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "  evt.currentTarget.classList.add('active');"
         "  if (tabName === 'home') {"
         "    refreshStatus();"
+        "    checkPowerStatus();"
+        "    updateBatteryStatus();"
+        "    updateWiFiStatus();"
         "  } else if (tabName === 'power-control') {"
         "    checkPowerStatus();"
         "    updateBatteryStatus();"
@@ -327,11 +347,9 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "}"
         ""
         "function refreshStatus() {"
-        "  console.log('Refreshing status...');"
         "  fetch('/check_swd')"
         "    .then(response => response.json())"
         "    .then(data => {"
-        "      console.log('Received data:', data);"
         "      updateHomeStatus(data);"
         "    })"
         "    .catch(error => {"
@@ -404,6 +422,7 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "  "
         "  document.getElementById('last-check').textContent = new Date().toLocaleTimeString();"
         "      updateBatteryStatus();"
+        "      updateWiFiStatus();"
         "}"
         ""
         "function checkSWD() {"
@@ -589,6 +608,68 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "    });"
         "}"
         ""
+        "function updateWiFiStatus() {"
+        "  fetch('/wifi_status')"
+        "    .then(response => response.json())"
+        "    .then(data => {"
+        "      if (data.connected) {"
+        "        let modeEl = document.getElementById('wifi-mode');"
+        "        if (modeEl) {"
+        "          let modeHtml = data.mode;"
+        "          if (data.is_lr) {"
+        "            modeHtml = '<span style=\"color:#17a2b8;font-weight:bold;\">🚀 ' + data.mode + '</span>';"
+        "          } else {"
+        "            modeHtml = '<span style=\"color:#28a745;\">📡 ' + data.mode + '</span>';"
+        "          }"
+        "          modeEl.innerHTML = modeHtml;"
+        "        }"
+        "        let ssidEl = document.getElementById('wifi-ssid');"
+        "        if (ssidEl) ssidEl.textContent = data.ssid || 'Unknown';"
+        "        let rssiEl = document.getElementById('wifi-rssi');"
+        "        if (rssiEl && data.rssi) {"
+        "          let rssiColor = '#28a745';"
+        "          if (data.rssi < -80) rssiColor = '#dc3545';"
+        "          else if (data.rssi < -70) rssiColor = '#ffc107';"
+        "          rssiEl.innerHTML = '<span style=\"color:' + rssiColor + ';\">' + data.rssi + ' dBm</span>';"
+        "        }"
+        "        let qualityEl = document.getElementById('wifi-quality');"
+        "        if (qualityEl && data.quality) {"
+        "          let barColor = '#28a745';"
+        "          if (data.quality < 30) barColor = '#dc3545';"
+        "          else if (data.quality < 60) barColor = '#ffc107';"
+        "          let bars = '▁▂▃▄▅';"
+        "          let barCount = Math.ceil(data.quality / 20);"
+        "          let barDisplay = bars.substr(0, barCount);"
+        "          qualityEl.innerHTML = '<span style=\"color:' + barColor + ';\">' + barDisplay + ' ' + data.quality + '%</span>';"
+        "        }"
+        "        if (data.channel) {"
+        "          document.getElementById('wifi-channel').textContent = data.channel;"
+        "        }"
+        "        if (data.phy_mode) {"
+        "          document.getElementById('wifi-phy').textContent = data.phy_mode;"
+        "        }"
+        "        if (data.gateway) {"
+        "          document.getElementById('wifi-gateway').textContent = data.gateway;"
+        "        }"
+        "        if (data.ip) {"
+        "          document.getElementById('device-ip').textContent = data.ip;"
+        "        }"
+        "      } else {"
+        "        document.getElementById('wifi-mode').innerHTML = '<span style=\"color:#dc3545;\">Disconnected</span>';"
+        "        document.getElementById('wifi-ssid').textContent = 'N/A';"
+        "        document.getElementById('wifi-rssi').textContent = 'N/A';"
+        "        document.getElementById('wifi-quality').textContent = 'N/A';"
+        "        document.getElementById('wifi-channel').textContent = 'N/A';"
+        "        document.getElementById('wifi-phy').textContent = 'N/A';"
+        "        document.getElementById('wifi-gateway').textContent = 'N/A';"
+        "      }"
+        "    })"
+        "    .catch(error => {"
+        "      console.error('WiFi status error:', error);"
+        "      document.getElementById('wifi-mode').innerHTML = '<span style=\"color:#dc3545;\">Error</span>';"
+        "    });"
+        "}"
+        ""
         "function powerOn() {"
         "  document.getElementById('powerOperationStatus').textContent = 'Turning on...';"
         "  fetch('/power_on', {method: 'POST'})"
@@ -665,19 +746,55 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "  xhr.send(file);"
         "}"
         ""
-        "console.log('=== BEFORE BLE FUNCTIONS ===');"
-        ""
-        "// Initialize page"
-        "document.addEventListener('DOMContentLoaded', function() {"
-        "  console.log('Page loaded, initializing...');"
-        "  refreshStatus();"
-        "  checkPowerStatus();"
-        "  updateBatteryStatus();"
+        "// Call functions immediately when script loads (don't wait for DOMContentLoaded)"
+        "window.addEventListener('load', function() {"
+        "  // Call all status functions immediately"
+        "  setTimeout(function() {"
+        "    refreshStatus();"
+        "    checkPowerStatus();"
+        "    updateBatteryStatus();"
+        "    updateWiFiStatus();"
+        "  }, 100);"
+        "  "
+        "  // Set up periodic updates"
         "  setInterval(refreshStatus, 10000);"
+        "  "
         "  setInterval(checkPowerStatus, 5000);"
         "  setInterval(updateBatteryStatus, 5000);"
+        "  setInterval(updateWiFiStatus, 5000);"
         "});"
+        ""
+        "// Also try to initialize immediately if page is already loaded"
+        "if (document.readyState === 'complete' || document.readyState === 'interactive') {"
+        "  console.log('Page already loaded - initializing immediately...');"
+        "  setTimeout(function() {"
+        "    refreshStatus();"
+        "    checkPowerStatus();"
+        "    updateBatteryStatus();"
+        "    updateWiFiStatus();"
+        "  }, 100);"
+        "}"
+        ""
         "console.log('=== SCRIPT END ===');"
+        ""
+        "// Initialize everything on page load"
+        "console.log('Initializing status on page load...');"
+        ""
+        "// Use a short timeout to ensure DOM is ready"
+        "setTimeout(function() {"
+        "  console.log('Running initial status checks...');"
+        "  if (typeof refreshStatus === 'function') refreshStatus();"
+        "  if (typeof checkPowerStatus === 'function') checkPowerStatus();"
+        "  if (typeof updateBatteryStatus === 'function') updateBatteryStatus();"
+        "  if (typeof updateWiFiStatus === 'function') updateWiFiStatus();"
+        "}, 500);"
+        ""
+        "// Set up periodic updates"
+        "setInterval(refreshStatus, 10000);"
+        "setInterval(checkPowerStatus, 5000);"
+        "setInterval(updateBatteryStatus, 5000);"
+        "setInterval(updateWiFiStatus, 5000);"
+        ""
         "</script>"
         "</body></html>";
 
@@ -871,7 +988,6 @@ static esp_err_t try_wifi_connection(void) {
     }
 
     wifi_config_t wifi_config = {0};
-    esp_err_t ret;
 
     // First, try ESP-LR connection if enabled
     if (WIFI_LR_ENABLED && !lr_wifi_tried) {
@@ -902,6 +1018,8 @@ static esp_err_t try_wifi_connection(void) {
             ESP_LOGI(TAG, "✓ Connected to ESP-LR AP successfully!");
             wifi_state = WIFI_STATE_CONNECTED;
             wifi_retry_count = 0;
+            // Track that we're in LR mode
+            power_set_wifi_info(true, WIFI_LR_SSID);
             return ESP_OK;
         }
 
@@ -934,6 +1052,8 @@ static esp_err_t try_wifi_connection(void) {
         ESP_LOGI(TAG, "✓ Connected to normal WiFi successfully!");
         wifi_state = WIFI_STATE_CONNECTED;
         wifi_retry_count = 0;
+        // Track that we're in normal mode
+        power_set_wifi_info(false, WIFI_SSID);
         return ESP_OK;
     }
 
@@ -953,7 +1073,7 @@ static esp_err_t try_wifi_connection(void) {
 // Enhanced WiFi event handler with sleep management
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                               int32_t event_id, void* event_data) {
-    static bool disconnect_timer_started = false;
+    static int reconnect_attempts = 0;
 
     if (event_base == WIFI_EVENT) {
         switch (event_id) {
@@ -968,28 +1088,23 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                 strcpy(device_ip, "Not connected");
                 stop_webserver();
 
-                // Start grace period timer before sleep
-                if (!disconnect_timer_started && ENABLE_DEEP_SLEEP_POWER_MGMT) {
-                    disconnect_timer_started = true;
-                    ESP_LOGI(TAG, "Starting %dms grace period before sleep check",
-                            WIFI_DISCONNECT_GRACE_MS);
+                reconnect_attempts++;
 
-                    // Create one-shot timer for sleep check
-                    const esp_timer_create_args_t timer_args = {
-                        .callback = &check_sleep_after_disconnect,
-                        .name = "sleep_check"
-                    };
+                // Use the config value instead of hardcoded 3
+                if (reconnect_attempts < WIFI_RECONNECT_ATTEMPTS) {
+                    ESP_LOGI(TAG, "Attempting reconnect %d/%d",
+                            reconnect_attempts, WIFI_RECONNECT_ATTEMPTS);
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    esp_wifi_connect();
+                } else {
+                    ESP_LOGW(TAG, "Max reconnect attempts (%d) reached - entering deep sleep",
+                            WIFI_RECONNECT_ATTEMPTS);
+                    esp_wifi_stop();
 
-                    if (sleep_check_timer == NULL) {
-                        esp_timer_create(&timer_args, &sleep_check_timer);
-                    }
-                    esp_timer_start_once(sleep_check_timer,
-                                       WIFI_DISCONNECT_GRACE_MS * 1000);
+                    // Just go to sleep immediately - no checking, no waiting
+                    power_enter_adaptive_deep_sleep();
+                    // Never returns
                 }
-
-                // Try to reconnect
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                esp_wifi_connect();
                 break;
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -1000,7 +1115,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         wifi_state = WIFI_STATE_CONNECTED;
         wifi_retry_count = 0;
         lr_wifi_tried = false; // Reset for next connection attempt
-        disconnect_timer_started = false; // Reset timer flag
+        reconnect_attempts = 0;  // Reset on successful connection
 
         // Cancel any pending sleep timer
         if (sleep_check_timer) {
@@ -1163,6 +1278,7 @@ static void system_health_task(void *arg) {
 }
 
 // Critical error handler
+__attribute__((unused))
 static void handle_critical_error(const char *context, esp_err_t error) {
     ESP_LOGE(TAG, "Critical error in %s: %s", context, esp_err_to_name(error));
     recovery_count++;
@@ -1228,7 +1344,15 @@ static esp_err_t release_swd_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-
+// Manual sleep test for debugging
+static void test_deep_sleep_command(void) {
+    ESP_LOGI(TAG, "=== Manual Deep Sleep Test ===");
+    ESP_LOGI(TAG, "Stopping WiFi...");
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "Entering deep sleep for 1 minute...");
+    power_enter_adaptive_deep_sleep();
+}
 
 // Main application entry
 void app_main(void) {
@@ -1291,25 +1415,24 @@ void app_main(void) {
         ESP_LOGI(TAG, "Web interface available at: http://%s", device_ip);
     }
 
-    // Main loop with battery monitoring
+    // Main loop - just status logging
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(30000)); // Check every 30 seconds
+        vTaskDelay(pdMS_TO_TICKS(10000)); // Status logging every 10 seconds
 
-        // Update battery status
+        battery_status_t battery;
         power_get_battery_status(&battery);
 
-        if (LOG_BATTERY_STATS) {
-            ESP_LOGI(TAG, "Status - Battery: %.2fV WiFi: %s IP: %s",
-                    battery.voltage,
-                    wifi_state == WIFI_STATE_CONNECTED ? "Connected" : "Disconnected",
-                    device_ip);
-        }
+        bool wifi_connected = (xEventGroupGetBits(system_events) & WIFI_CONNECTED_BIT) != 0;
 
-        // Check if we should enter sleep
-        if (wifi_state != WIFI_STATE_CONNECTED &&
-            power_should_enter_deep_sleep(false)) {
-            ESP_LOGI(TAG, "Entering deep sleep from main loop");
-            power_enter_adaptive_deep_sleep();
+        ESP_LOGI(TAG, "Status - Battery: %.2fV WiFi: %s Wake count: %lu",
+                battery.voltage,
+                wifi_connected ? "Connected" : "Disconnected",
+                power_get_wake_count());
+
+        // If connected, just reset the wake counter
+        if (wifi_connected) {
+            power_reset_wake_count();
         }
+        // Main loop doesn't handle sleep - that's done in the WiFi event handler
     }
 }
