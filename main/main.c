@@ -26,6 +26,7 @@
 #include "swd_flash.h"
 #include "power_mgmt.h"
 #include "flash_safety.h"
+#include "wifi_manager.h"
 
 
 static const char *TAG = "FLASHER";
@@ -39,22 +40,8 @@ static EventGroupHandle_t system_events;
 #define RECOVERY_MODE_BIT   BIT4
 
 // Global variables
-static char device_ip[16] = "Not connected";
+static char* device_ip = "Not connected";
 static httpd_handle_t web_server = NULL;
-
-// WiFi connection management
-typedef enum {
-    WIFI_STATE_DISCONNECTED,
-    WIFI_STATE_CONNECTING_LR,
-    WIFI_STATE_CONNECTING_NORMAL,
-    WIFI_STATE_CONNECTED,
-    WIFI_STATE_FAILED
-} wifi_state_t;
-
-static wifi_state_t wifi_state = WIFI_STATE_DISCONNECTED;
-static int wifi_retry_count = 0;
-static bool lr_wifi_tried = false;
-static esp_timer_handle_t sleep_check_timer = NULL;
 static uint32_t wake_count = 0;
 
 // System configuration
@@ -85,10 +72,6 @@ static uint32_t recovery_count = 0;
 
 // Function declarations
 static void init_system(void);
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                              int32_t event_id, void* event_data);
-static esp_err_t try_wifi_connection(void);
-static void check_sleep_after_disconnect(void* arg);
 static void system_health_task(void *arg);
 static esp_err_t try_swd_connection(void);
 static void handle_critical_error(const char *context, esp_err_t error);
@@ -103,22 +86,6 @@ static esp_err_t release_swd_handler(httpd_req_t *req);
 static void init_config(void) {
     strcpy(sys_config.wifi_ssid, WIFI_SSID);
     strcpy(sys_config.wifi_password, WIFI_PASSWORD);
-}
-
-// Callback to check if we should sleep after disconnect
-static void check_sleep_after_disconnect(void* arg) {
-    if (wifi_state != WIFI_STATE_CONNECTED) {
-        ESP_LOGI(TAG, "WiFi still disconnected after grace period");
-        if (power_should_enter_deep_sleep(false)) {
-            ESP_LOGI(TAG, "Entering deep sleep due to persistent disconnect");
-            power_enter_adaptive_deep_sleep();
-        }
-    }
-
-    if (sleep_check_timer) {
-        esp_timer_delete(sleep_check_timer);
-        sleep_check_timer = NULL;
-    }
 }
 
 // Enhanced web server handler with new tabbed interface
@@ -967,164 +934,7 @@ static void test_memory_regions(void) {
 }
 
 // Enhanced WiFi connection with LR and normal fallback
-static esp_err_t try_wifi_connection(void) {
-    ESP_LOGI(TAG, "=== Starting WiFi Connection Sequence ===");
 
-    // Initialize WiFi if not already done
-    static bool wifi_initialized = false;
-    if (!wifi_initialized) {
-        ESP_ERROR_CHECK(esp_netif_init());
-        ESP_ERROR_CHECK(esp_event_loop_create_default());
-        esp_netif_create_default_wifi_sta();
-
-        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                  &wifi_event_handler, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                  &wifi_event_handler, NULL));
-        wifi_initialized = true;
-    }
-
-    wifi_config_t wifi_config = {0};
-
-    // First, try ESP-LR connection if enabled
-    if (WIFI_LR_ENABLED && !lr_wifi_tried) {
-        ESP_LOGI(TAG, "Attempting ESP-LR WiFi connection to: %s", WIFI_LR_SSID);
-        wifi_state = WIFI_STATE_CONNECTING_LR;
-        lr_wifi_tried = true;
-
-        strcpy((char*)wifi_config.sta.ssid, WIFI_LR_SSID);
-        strcpy((char*)wifi_config.sta.password, WIFI_LR_PASSWORD);
-
-        // Configure for long-range mode
-        wifi_config.sta.listen_interval = 3;
-        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-
-        // Set WiFi to long-range mode
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-        ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR));
-        ESP_ERROR_CHECK(esp_wifi_start());
-
-        // Wait for connection with timeout
-        EventBits_t bits = xEventGroupWaitBits(system_events,
-                                              WIFI_CONNECTED_BIT,
-                                              pdFALSE, pdFALSE,
-                                              pdMS_TO_TICKS(WIFI_LR_CONNECT_TIMEOUT_SEC * 1000));
-
-        if (bits & WIFI_CONNECTED_BIT) {
-            ESP_LOGI(TAG, "✓ Connected to ESP-LR AP successfully!");
-            wifi_state = WIFI_STATE_CONNECTED;
-            wifi_retry_count = 0;
-            // Track that we're in LR mode
-            power_set_wifi_info(true, WIFI_LR_SSID);
-            return ESP_OK;
-        }
-
-        ESP_LOGW(TAG, "ESP-LR connection failed, trying normal WiFi...");
-        esp_wifi_stop();
-    }
-
-    // Try normal WiFi connection
-    ESP_LOGI(TAG, "Attempting normal WiFi connection to: %s", WIFI_SSID);
-    wifi_state = WIFI_STATE_CONNECTING_NORMAL;
-
-    strcpy((char*)wifi_config.sta.ssid, WIFI_SSID);
-    strcpy((char*)wifi_config.sta.password, WIFI_PASSWORD);
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-
-    // Set back to normal protocol
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
-                    WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    // Wait for connection
-    EventBits_t bits = xEventGroupWaitBits(system_events,
-                                          WIFI_CONNECTED_BIT,
-                                          pdFALSE, pdFALSE,
-                                          pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_SEC * 1000));
-
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "✓ Connected to normal WiFi successfully!");
-        wifi_state = WIFI_STATE_CONNECTED;
-        wifi_retry_count = 0;
-        // Track that we're in normal mode
-        power_set_wifi_info(false, WIFI_SSID);
-        return ESP_OK;
-    }
-
-    ESP_LOGE(TAG, "✗ All WiFi connection attempts failed");
-    wifi_state = WIFI_STATE_FAILED;
-    wifi_retry_count++;
-
-    // Check if we should enter deep sleep
-    if (power_should_enter_deep_sleep(false)) {
-        ESP_LOGI(TAG, "Entering adaptive deep sleep due to connection failure");
-        power_enter_adaptive_deep_sleep();
-    }
-
-    return ESP_FAIL;
-}
-
-// Enhanced WiFi event handler with sleep management
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                              int32_t event_id, void* event_data) {
-    static int reconnect_attempts = 0;
-
-    if (event_base == WIFI_EVENT) {
-        switch (event_id) {
-            case WIFI_EVENT_STA_START:
-                esp_wifi_connect();
-                break;
-
-            case WIFI_EVENT_STA_DISCONNECTED:
-                xEventGroupClearBits(system_events, WIFI_CONNECTED_BIT);
-                wifi_state = WIFI_STATE_DISCONNECTED;
-                ESP_LOGI(TAG, "WiFi disconnected");
-                strcpy(device_ip, "Not connected");
-                stop_webserver();
-
-                reconnect_attempts++;
-
-                // Use the config value instead of hardcoded 3
-                if (reconnect_attempts < WIFI_RECONNECT_ATTEMPTS) {
-                    ESP_LOGI(TAG, "Attempting reconnect %d/%d",
-                            reconnect_attempts, WIFI_RECONNECT_ATTEMPTS);
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                    esp_wifi_connect();
-                } else {
-                    ESP_LOGW(TAG, "Max reconnect attempts (%d) reached - entering deep sleep",
-                            WIFI_RECONNECT_ATTEMPTS);
-                    esp_wifi_stop();
-
-                    // Just go to sleep immediately - no checking, no waiting
-                    power_enter_adaptive_deep_sleep();
-                    // Never returns
-                }
-                break;
-        }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        snprintf(device_ip, sizeof(device_ip), IPSTR, IP2STR(&event->ip_info.ip));
-        ESP_LOGI(TAG, "Got IP: %s", device_ip);
-        xEventGroupSetBits(system_events, WIFI_CONNECTED_BIT);
-        wifi_state = WIFI_STATE_CONNECTED;
-        wifi_retry_count = 0;
-        lr_wifi_tried = false; // Reset for next connection attempt
-        reconnect_attempts = 0;  // Reset on successful connection
-
-        // Cancel any pending sleep timer
-        if (sleep_check_timer) {
-            esp_timer_stop(sleep_check_timer);
-        }
-
-        start_webserver();
-    }
-}
 
 // Test SWD functions
 static void test_swd_functions(void) {
@@ -1297,7 +1107,7 @@ static void handle_critical_error(const char *context, esp_err_t error) {
 // System initialization
 // System initialization
 static void init_system(void) {
-    // CRITICAL: NVS must be initialized before BLE
+    // CRITICAL: NVS must be initialized before other systems
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -1305,31 +1115,30 @@ static void init_system(void) {
     }
     ESP_ERROR_CHECK(ret);
     ESP_LOGI(TAG, "NVS Flash initialized");
-    
+
     init_config();
     system_events = xEventGroupCreate();
-    
+
     power_config_t power_cfg = {
         .target_power_gpio = TARGET_POWER_GPIO,
         .power_on_delay_ms = 100,
         .reset_hold_ms = 50,
-        .sleep_duration_sec = sys_config.sleep_timeout_sec,
+        .sleep_duration_sec = 0,  // Not used with adaptive sleep
         .wifi_check_interval_ms = 5000,
-        .wifi_timeout_ms = 10000,
-        .wake_ssid = sys_config.wifi_ssid,
+        .wifi_timeout_ms = (WIFI_LR_CONNECT_TIMEOUT_SEC + WIFI_CONNECT_TIMEOUT_SEC) * 1000,
+        .wake_ssid = WIFI_SSID,
         .watchdog_timeout_sec = 0,
         .enable_brownout_detect = true,
-        .max_retry_count = 3,
+        .max_retry_count = WIFI_RECONNECT_ATTEMPTS,
         .error_cooldown_ms = 1000
     };
     ESP_ERROR_CHECK(power_mgmt_init(&power_cfg));
-    
+
     wake_reason_t wake_reason = power_get_wake_reason();
     ESP_LOGI(TAG, "Wake reason: %d", wake_reason);
 
     ESP_LOGI(TAG, "Initializing SWD connection...");
     try_swd_connection();
-    
 
     xTaskCreate(system_health_task, "health", 4096, NULL, 5, NULL);
 }
@@ -1357,18 +1166,18 @@ static void test_deep_sleep_command(void) {
 // Main application entry
 void app_main(void) {
     ESP_LOGI(TAG, "=================================");
-    ESP_LOGI(TAG, "Mesh Radio Flasher v1.0 (No Bluetooth)");
+    ESP_LOGI(TAG, "Mesh Radio Flasher v%s", DEVICE_VERSION);
     ESP_LOGI(TAG, "Build: %s %s", __DATE__, __TIME__);
     ESP_LOGI(TAG, "=================================");
 
-    // Check wake reason
+    // Check and log wake reason
     esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
     if (wake_cause == ESP_SLEEP_WAKEUP_TIMER) {
-        ESP_LOGI(TAG, "Woke from deep sleep timer");
-        wake_count++;
+        wake_count = power_get_wake_count() + 1;
+        ESP_LOGI(TAG, "=== Woke from deep sleep (count: %lu) ===", wake_count);
     } else {
-        ESP_LOGI(TAG, "Fresh boot");
         wake_count = 0;
+        ESP_LOGI(TAG, "=== Fresh boot (power on) ===");
     }
 
     // Initialize system
@@ -1376,63 +1185,110 @@ void app_main(void) {
 
     // Restore state if waking from deep sleep
     if (wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
+        ESP_LOGI(TAG, "Restoring state from deep sleep...");
         power_restore_from_deep_sleep();
     }
 
-    // Get battery status
+    // Check battery status
     battery_status_t battery;
     power_get_battery_status(&battery);
     ESP_LOGI(TAG, "Battery: %.2fV (%.0f%%) - %s",
             battery.voltage, battery.percentage,
             battery.is_critical ? "CRITICAL" :
-            battery.is_low ? "LOW" : "OK");
+            battery.is_low ? "LOW" :
+            battery.voltage > BATTERY_HIGH_THRESHOLD ? "HIGH" : "NORMAL");
 
-    // Check for critical battery conditions
-    if (battery.voltage < BATTERY_CRITICAL_THRESHOLD) {
-        ESP_LOGW(TAG, "Critical battery! Entering extended deep sleep");
-        power_target_off(); // Turn off nRF52 to save power
+    // Critical battery protection
+    if (battery.voltage < BATTERY_CRITICAL_THRESHOLD && ENABLE_BATTERY_PROTECTION) {
+        ESP_LOGW(TAG, "!!! Critical battery (%.2fV) - entering extended deep sleep (%d sec) !!!",
+                battery.voltage, DEEP_SLEEP_CRITICAL_SEC);
+        power_target_off();  // Turn off nRF52 to save power
         power_enter_adaptive_deep_sleep();
+        // Never returns
     }
 
-    // Check if nRF52 should be powered off
-    if (battery.voltage < NRF52_POWER_OFF_VOLTAGE) {
-        ESP_LOGW(TAG, "Low battery - turning off nRF52 radio");
-        power_target_off();
-    }
-
-    // Try WiFi connection
-    esp_err_t wifi_result = try_wifi_connection();
-
-    if (wifi_result != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi connection failed - checking sleep conditions");
-        if (power_should_enter_deep_sleep(false)) {
-            power_enter_adaptive_deep_sleep();
+    // Low battery nRF52 protection
+    if (battery.voltage < NRF52_POWER_OFF_VOLTAGE && ENABLE_BATTERY_PROTECTION) {
+        if (power_target_is_on()) {
+            ESP_LOGW(TAG, "Low battery (%.2fV) - turning off nRF52 radio", battery.voltage);
+            power_target_off();
         }
     }
 
+    // Initialize WiFi manager
+    ESP_LOGI(TAG, "Initializing WiFi manager...");
+    ESP_ERROR_CHECK(wifi_manager_init());
+
+    // Attempt WiFi connection (tries LR first, then normal)
+    ESP_LOGI(TAG, "Attempting WiFi connection...");
+    if (wifi_manager_connect() != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi connection failed - entering deep sleep");
+        power_enter_adaptive_deep_sleep();
+        // Never returns
+    }
+
+    // WiFi connected successfully
+    ESP_LOGI(TAG, "✓ WiFi connected successfully");
+    const char* ip = wifi_manager_get_ip();
+    ESP_LOGI(TAG, "IP Address: %s", ip);
+    ESP_LOGI(TAG, "Mode: %s", power_get_wifi_is_lr() ? "ESP-LR" : "Normal");
+    ESP_LOGI(TAG, "SSID: %s", power_get_wifi_ssid());
+
+    // Update global IP
+    device_ip = (char*)ip;
+
+    // Start web server
+    ESP_LOGI(TAG, "Starting web server...");
+    esp_err_t server_result = start_webserver();
+    if (server_result == ESP_OK) {
+        ESP_LOGI(TAG, "✓ Web server started on port 80");
+        ESP_LOGI(TAG, "=================================");
+        ESP_LOGI(TAG, "Web interface: http://%s", device_ip);
+        ESP_LOGI(TAG, "=================================");
+    } else {
+        ESP_LOGE(TAG, "✗ Failed to start web server: %s", esp_err_to_name(server_result));
+    }
+
+    // Initialize SWD interface (optional - for initial testing)
+    ESP_LOGI(TAG, "Testing SWD connection...");
+    try_swd_connection();
+
+    // System ready
+    ESP_LOGI(TAG, "=================================");
     ESP_LOGI(TAG, "=== System Ready ===");
-    if (wifi_state == WIFI_STATE_CONNECTED) {
-        ESP_LOGI(TAG, "Web interface available at: http://%s", device_ip);
-    }
+    ESP_LOGI(TAG, "Web interface: http://%s", device_ip);
+    ESP_LOGI(TAG, "Power: nRF52 is %s", power_target_is_on() ? "ON" : "OFF");
+    ESP_LOGI(TAG, "WiFi: %s mode", power_get_wifi_is_lr() ? "ESP-LR" : "Normal");
+    ESP_LOGI(TAG, "=================================");
 
-    // Main loop - just status logging
+    // Main monitoring loop
+    TickType_t last_status = xTaskGetTickCount();
+
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000)); // Status logging every 10 seconds
+        vTaskDelay(pdMS_TO_TICKS(1000));  // Check every second
 
-        battery_status_t battery;
-        power_get_battery_status(&battery);
+        // Log status every 10 seconds
+        if ((xTaskGetTickCount() - last_status) > pdMS_TO_TICKS(10000)) {
+            battery_status_t batt;
+            power_get_battery_status(&batt);
 
-        bool wifi_connected = (xEventGroupGetBits(system_events) & WIFI_CONNECTED_BIT) != 0;
+            ESP_LOGI(TAG, "Status: Battery=%.2fV (%.0f%%) | WiFi=%s | Wake=%lu | nRF52=%s",
+                    batt.voltage,
+                    batt.percentage,
+                    wifi_manager_is_connected() ? "Connected" : "Disconnected",
+                    power_get_wake_count(),
+                    power_target_is_on() ? "ON" : "OFF");
 
-        ESP_LOGI(TAG, "Status - Battery: %.2fV WiFi: %s Wake count: %lu",
-                battery.voltage,
-                wifi_connected ? "Connected" : "Disconnected",
-                power_get_wake_count());
+            // Check for low battery condition
+            if (batt.voltage < NRF52_POWER_OFF_VOLTAGE &&
+                power_target_is_on() &&
+                ENABLE_BATTERY_PROTECTION) {
+                ESP_LOGW(TAG, "Battery dropped below %.2fV - turning off nRF52",
+                        NRF52_POWER_OFF_VOLTAGE);
+                power_target_off();
+            }
 
-        // If connected, just reset the wake counter
-        if (wifi_connected) {
-            power_reset_wake_count();
+            last_status = xTaskGetTickCount();
         }
-        // Main loop doesn't handle sleep - that's done in the WiFi event handler
     }
 }
