@@ -18,4 +18,7 @@ wifi_state_t wifi_manager_get_state(void);
 const char* wifi_manager_get_ip(void);
 void wifi_manager_shutdown(void);
 
+// External function from main.c for web server cleanup
+extern void stop_webserver(void);
+
 #endif

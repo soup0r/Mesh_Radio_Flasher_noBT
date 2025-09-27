@@ -34,6 +34,20 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
         ESP_LOGI(TAG, "WiFi disconnected (reason: %d)", disconn->reason);
 
+        // Log specific disconnect reason for debugging
+        const char* reason_str = "Unknown";
+        switch(disconn->reason) {
+            case WIFI_REASON_BEACON_TIMEOUT: reason_str = "Beacon timeout"; break;
+            case WIFI_REASON_NO_AP_FOUND: reason_str = "AP not found"; break;
+            case WIFI_REASON_AUTH_FAIL: reason_str = "Auth failed"; break;
+            case WIFI_REASON_ASSOC_FAIL: reason_str = "Association failed"; break;
+            case WIFI_REASON_HANDSHAKE_TIMEOUT: reason_str = "Handshake timeout"; break;
+            case WIFI_REASON_AP_TSF_RESET: reason_str = "AP time sync reset"; break;
+            case WIFI_REASON_ROAMING: reason_str = "Roaming"; break;
+            default: break;
+        }
+        ESP_LOGI(TAG, "Disconnect reason: %s", reason_str);
+
         xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
         current_state = WIFI_STATE_DISCONNECTED;
         strcpy(current_ip, "Not connected");
@@ -68,13 +82,16 @@ static esp_err_t try_wifi_mode(const char* ssid, const char* password, bool is_l
     // Small delay to let things settle
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Configure WiFi
+    // Configure WiFi with resilience settings
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = "",
             .password = "",
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
             .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
+            .listen_interval = 10,  // Check beacon every 10 intervals
+            .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,  // Connect to strongest AP
+            .failure_retry_cnt = 5,  // Retry connection 5 times before giving up
         },
     };
 
@@ -88,10 +105,29 @@ static esp_err_t try_wifi_mode(const char* ssid, const char* password, bool is_l
     if (is_lr) {
         ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR));
         ESP_LOGI(TAG, "WiFi protocol set to LR (Long Range) mode");
+
+        // LR mode specific settings
+        // Note: LR mode is already at max power and lowest rate
+        // Power save must be disabled for LR mode
+        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
     } else {
         ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
             WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
         ESP_LOGI(TAG, "WiFi protocol set to 802.11 BGN mode");
+
+        // Normal mode can use max power
+        ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(84));  // 21dBm
+
+        // Power save optional for normal mode
+        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    }
+
+    // Set inactive time (how long before AP considers us disconnected)
+    esp_err_t err;  // Declare once
+    err = esp_wifi_set_inactive_time(WIFI_IF_STA, 30);  // 30 seconds
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Set WiFi inactive time to 30 seconds");
     }
 
     // Start WiFi
@@ -102,7 +138,7 @@ static esp_err_t try_wifi_mode(const char* ssid, const char* password, bool is_l
 
     // Manually connect
     ESP_LOGI(TAG, "Calling esp_wifi_connect()...");
-    esp_err_t err = esp_wifi_connect();
+    err = esp_wifi_connect();  // Reuse the same err variable
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
         return ESP_FAIL;
@@ -159,7 +195,12 @@ esp_err_t wifi_manager_init(void) {
     
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    
+
+    // === ADD ADVANCED RESILIENCE CONFIG ===
+    // Note: Auto-reconnect is disabled by default in ESP-IDF
+    // Note: Power save and TX power are now set per-mode in try_wifi_mode()
+
+    // Continue with event handlers...
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                               &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
@@ -204,47 +245,32 @@ esp_err_t wifi_manager_connect(void) {
 }
 
 void wifi_manager_disconnect_handler(void) {
-    static int reconnect_count = 0;
     static bool handling_disconnect = false;
-    
+
     // Prevent recursive calls
     if (handling_disconnect || is_connecting) {
         return;
     }
-    
+
     handling_disconnect = true;
-    reconnect_count++;
-    
-    ESP_LOGI(TAG, "Disconnect handler - reconnect attempt %d/%d", 
-            reconnect_count, WIFI_RECONNECT_ATTEMPTS);
-    
-    if (reconnect_count <= WIFI_RECONNECT_ATTEMPTS) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        
-        // Try full connection sequence again (LR first, then normal)
-        if (wifi_manager_connect() == ESP_OK) {
-            reconnect_count = 0;
-            handling_disconnect = false;
-            return;
-        }
-    }
-    
-    // All reconnection attempts failed
-    ESP_LOGW(TAG, "Max reconnect attempts reached - waiting %d seconds before deep sleep",
-             WIFI_DISCONNECT_GRACE_SEC);
-    
-    reconnect_count = 0;
+
+    ESP_LOGW(TAG, "WiFi disconnected - cleaning up and entering deep sleep");
+
+    // Stop the web server before WiFi shutdown
+    extern void stop_webserver(void);  // Forward declaration
+    stop_webserver();
+    ESP_LOGI(TAG, "Web server stopped");
+
+    // Stop WiFi cleanly
     esp_wifi_stop();
-    
-    vTaskDelay(pdMS_TO_TICKS(WIFI_DISCONNECT_GRACE_SEC * 1000));
-    
-    if (current_state != WIFI_STATE_CONNECTED) {
-        ESP_LOGI(TAG, "Entering deep sleep after disconnect");
-        power_enter_adaptive_deep_sleep();
-        // Never returns
-    }
-    
-    handling_disconnect = false;
+
+    // Give a short delay for cleanup
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // Enter deep sleep immediately
+    ESP_LOGI(TAG, "Entering deep sleep after disconnect");
+    power_enter_adaptive_deep_sleep();
+    // Never returns
 }
 
 bool wifi_manager_is_connected(void) {

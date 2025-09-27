@@ -17,9 +17,26 @@
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"       // Your regular WiFi password
 #define WIFI_CONNECT_TIMEOUT_SEC 10             // Seconds to wait for normal connection
 
-// WiFi Reconnection Settings
-#define WIFI_RECONNECT_ATTEMPTS 2                // Immediate reconnect attempts after disconnect
-#define WIFI_DISCONNECT_GRACE_SEC 5             // Seconds to wait before sleep after disconnect
+// WiFi Reconnection Settings (DEPRECATED - Device now sleeps immediately on disconnect)
+// #define WIFI_RECONNECT_ATTEMPTS 2             // No longer used
+// #define WIFI_DISCONNECT_GRACE_SEC 5           // No longer used
+
+// =============================================================================
+// WiFi Resilience Settings
+// =============================================================================
+
+// Connection stability parameters
+#define WIFI_BEACON_TIMEOUT_ENABLE true         // Enable extended beacon timeout
+#define WIFI_BEACON_TIMEOUT 30                  // Seconds before considering AP lost
+#define WIFI_SCAN_RSSI_THRESHOLD -85            // Minimum RSSI to attempt connection (dBm)
+
+// Power management trade-offs
+#define WIFI_PS_MODE WIFI_PS_NONE               // NONE=stable, MIN_MODEM=power save
+#define WIFI_ENABLE_11B_RATE true               // Use 802.11b rates for better range
+
+// Mode-specific notes:
+// ESP-LR: Fixed 250 Kbps, max power, power save must be NONE, 2-4x range
+// Normal: Variable rates, configurable power, can use power save, standard range
 
 // =============================================================================
 // Hardware Configuration

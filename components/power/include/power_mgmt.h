@@ -24,7 +24,7 @@ typedef struct {
     bool enable_brownout_detect;    // Enable brownout detection
     
     // Recovery settings
-    uint32_t max_retry_count;       // Max retries before deep sleep
+    // uint32_t max_retry_count;       // REMOVED - no longer used
     uint32_t error_cooldown_ms;     // Delay between error retries
 } power_config_t;
 

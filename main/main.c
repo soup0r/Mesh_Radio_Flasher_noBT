@@ -77,9 +77,8 @@ static esp_err_t try_swd_connection(void);
 static void handle_critical_error(const char *context, esp_err_t error);
 static void test_swd_functions(void);
 static void test_memory_regions(void);
-static void test_deep_sleep_command(void);
 static esp_err_t start_webserver(void);
-static void stop_webserver(void);
+void stop_webserver(void);  // Made global for wifi_manager cleanup
 static esp_err_t release_swd_handler(httpd_req_t *req);
 
 // Initialize configuration from config.h
@@ -816,10 +815,13 @@ static esp_err_t start_webserver(void) {
 }
 
 // Stop web server
-static void stop_webserver(void) {
+// Stop web server (made global for wifi_manager cleanup)
+void stop_webserver(void) {
     if (web_server) {
+        ESP_LOGI(TAG, "Stopping web server");
         httpd_stop(web_server);
         web_server = NULL;
+        device_ip = "Not connected";  // Reset IP string
     }
 }
 
@@ -1129,7 +1131,7 @@ static void init_system(void) {
         .wake_ssid = WIFI_SSID,
         .watchdog_timeout_sec = 0,
         .enable_brownout_detect = true,
-        .max_retry_count = WIFI_RECONNECT_ATTEMPTS,
+        // .max_retry_count removed - no longer used
         .error_cooldown_ms = 1000
     };
     ESP_ERROR_CHECK(power_mgmt_init(&power_cfg));
@@ -1153,15 +1155,6 @@ static esp_err_t release_swd_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// Manual sleep test for debugging
-static void test_deep_sleep_command(void) {
-    ESP_LOGI(TAG, "=== Manual Deep Sleep Test ===");
-    ESP_LOGI(TAG, "Stopping WiFi...");
-    esp_wifi_stop();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "Entering deep sleep for 1 minute...");
-    power_enter_adaptive_deep_sleep();
-}
 
 // Main application entry
 void app_main(void) {
