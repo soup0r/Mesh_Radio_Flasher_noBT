@@ -484,27 +484,27 @@ const char* power_get_wifi_ssid(void) {
 
 // Function to calculate deep sleep duration based on battery level
 uint64_t calculate_sleep_duration_us(float battery_voltage) {
-    uint64_t sleep_minutes;
+    uint32_t sleep_seconds;
 
     if (battery_voltage < BATTERY_CRITICAL_THRESHOLD) {
-        sleep_minutes = DEEP_SLEEP_CRITICAL_HOURS * 60;
-        ESP_LOGW(TAG, "Critical battery (%.2fV) - sleeping for %d hours",
-                battery_voltage, DEEP_SLEEP_CRITICAL_HOURS);
+        sleep_seconds = DEEP_SLEEP_CRITICAL_SEC;
+        ESP_LOGW(TAG, "Critical battery (%.2fV) - sleeping for %d seconds",
+                battery_voltage, DEEP_SLEEP_CRITICAL_SEC);
     } else if (battery_voltage < BATTERY_MEDIUM_HIGH_THRESHOLD) {
-        sleep_minutes = DEEP_SLEEP_LOW_BATTERY_MIN;
-        ESP_LOGI(TAG, "Low battery (%.2fV) - sleeping for %d minutes",
-                battery_voltage, DEEP_SLEEP_LOW_BATTERY_MIN);
+        sleep_seconds = DEEP_SLEEP_LOW_BATTERY_SEC;
+        ESP_LOGI(TAG, "Low battery (%.2fV) - sleeping for %d seconds",
+                battery_voltage, DEEP_SLEEP_LOW_BATTERY_SEC);
     } else if (battery_voltage < BATTERY_HIGH_THRESHOLD) {
-        sleep_minutes = DEEP_SLEEP_MEDIUM_BATTERY_MIN;
-        ESP_LOGI(TAG, "Medium battery (%.2fV) - sleeping for %d minutes",
-                battery_voltage, DEEP_SLEEP_MEDIUM_BATTERY_MIN);
+        sleep_seconds = DEEP_SLEEP_MEDIUM_BATTERY_SEC;
+        ESP_LOGI(TAG, "Medium battery (%.2fV) - sleeping for %d seconds",
+                battery_voltage, DEEP_SLEEP_MEDIUM_BATTERY_SEC);
     } else {
-        sleep_minutes = DEEP_SLEEP_HIGH_BATTERY_MIN;
-        ESP_LOGI(TAG, "High battery (%.2fV) - sleeping for %d minutes",
-                battery_voltage, DEEP_SLEEP_HIGH_BATTERY_MIN);
+        sleep_seconds = DEEP_SLEEP_HIGH_BATTERY_SEC;
+        ESP_LOGI(TAG, "High battery (%.2fV) - sleeping for %d seconds",
+                battery_voltage, DEEP_SLEEP_HIGH_BATTERY_SEC);
     }
 
-    return sleep_minutes * 60 * 1000000ULL;
+    return sleep_seconds * 1000000ULL;
 }
 
 // Enhanced deep sleep function for ESP32-C3 with proper timing
@@ -691,7 +691,7 @@ esp_err_t power_restore_from_deep_sleep(void) {
     } else if (battery.voltage > (NRF52_POWER_OFF_VOLTAGE + POWER_ON_HYSTERESIS) &&
                !power_state && rtc_nrf_power_off_active) {
         // Battery has recovered - check if enough time has passed
-        uint32_t required_off_ms = NRF52_POWER_OFF_HOURS * 3600ULL * 1000ULL;
+        uint32_t required_off_ms = NRF52_POWER_OFF_SEC * 1000ULL;
 
         if (rtc_nrf_off_total_ms >= required_off_ms) {
             ESP_LOGI(TAG, "Battery recovered (%.2fV) and timeout elapsed (%llu/%lu ms) - turning nRF52 ON",

@@ -1012,7 +1012,7 @@ static esp_err_t try_wifi_connection(void) {
         EventBits_t bits = xEventGroupWaitBits(system_events,
                                               WIFI_CONNECTED_BIT,
                                               pdFALSE, pdFALSE,
-                                              pdMS_TO_TICKS(WIFI_LR_CONNECT_TIMEOUT_MS));
+                                              pdMS_TO_TICKS(WIFI_LR_CONNECT_TIMEOUT_SEC * 1000));
 
         if (bits & WIFI_CONNECTED_BIT) {
             ESP_LOGI(TAG, "✓ Connected to ESP-LR AP successfully!");
@@ -1046,7 +1046,7 @@ static esp_err_t try_wifi_connection(void) {
     EventBits_t bits = xEventGroupWaitBits(system_events,
                                           WIFI_CONNECTED_BIT,
                                           pdFALSE, pdFALSE,
-                                          pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+                                          pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_SEC * 1000));
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "✓ Connected to normal WiFi successfully!");
