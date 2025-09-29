@@ -5,18 +5,34 @@
 #include "swd_mem.h"
 #include "swd_core.h"
 #include "nrf52_hal.h"
+#include "power_mgmt.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
+#include <unistd.h>  // For close() function
+#include <sys/socket.h>  // For socket options
+#include <netinet/tcp.h>  // For TCP options
+#include <sys/stat.h>  // For stat()
+#include <stdio.h>  // For FILE operations
 
 static const char *TAG = "WEB_UPLOAD";
+
+#define UPLOAD_ABSOLUTE_TIMEOUT_SEC 600    // 10 minutes max for entire upload
+#define UPLOAD_NO_PROGRESS_TIMEOUT_SEC 60  // Fail if no progress for 60 seconds
+#define UPLOAD_LINE_BUFFER_SIZE 600        // Max hex line is ~520 chars
+#define UPLOAD_RECV_BUFFER_SIZE 1024       // 1KB for ESP-LR compatibility
+#define PAGE_BUFFER_SIZE (4 * 1024)        // Reduce from 16KB to 4KB
+#define NRF52_PAGE_SIZE 4096               // Keep existing if already defined
+
+// ESP-LR optimized chunk sizes
+#define LR_CHUNK_SIZE 1024        // 1KB chunks for LR mode
+#define NORMAL_CHUNK_SIZE 4096    // 4KB chunks for normal mode
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
 
-#define PAGE_BUFFER_SIZE (16 * 1024)
-#define NRF52_PAGE_SIZE 4096
-
-// Type definitions
+// Enhanced structure with packet loss tolerance
 typedef struct {
     bool in_progress;
     uint32_t total_bytes;
@@ -30,9 +46,24 @@ typedef struct {
     uint32_t buffer_data_len;
     char status_msg[128];
     bool error;
+
+    // Packet loss tolerance fields
+    char line_buffer[UPLOAD_LINE_BUFFER_SIZE];  // Buffer for incomplete hex lines
+    size_t line_pos;                            // Current position in line buffer
+    uint32_t last_progress_bytes;               // Bytes at last progress check
+    TickType_t last_progress_time;              // Time of last progress
+    TickType_t upload_start_time;               // Upload start time
+    uint32_t retry_count;                       // Current retry count
+    uint32_t total_retries;                     // Total retries during upload
 } upload_context_t;
 
 static upload_context_t *g_upload_ctx = NULL;
+static bool g_mass_erased = false;
+
+// Flash status tracking
+static bool g_flash_in_progress = false;
+static int g_flash_percent = 0;
+static char g_flash_status[128] = "Idle";
 
 // Helper function to ensure SWD is ready
 static esp_err_t ensure_swd_ready(void) {
@@ -72,69 +103,52 @@ static esp_err_t ensure_swd_ready(void) {
     return ESP_OK;
 }
 
-// Helper function for SWD reconnection
-static esp_err_t check_and_reconnect_swd(void) {
-    if (swd_is_connected()) {
-        return ESP_OK;
-    }
-    
-    ESP_LOGI(TAG, "Attempting SWD reconnection...");
-    
-    // Try to reconnect
-    esp_err_t ret = swd_connect();
-    if (ret != ESP_OK) {
-        // Try with reset
-        ret = swd_reset_target();
-        if (ret == ESP_OK) {
-            ret = swd_connect();
-        }
-    }
-    
-    if (ret == ESP_OK) {
-        ret = swd_flash_init();
-    }
-    
-    return ret;
-}
 
 // Flush buffer to flash
 static esp_err_t flush_buffer(upload_context_t *ctx) {
     if (ctx->buffer_data_len == 0) {
         return ESP_OK;
     }
-    
-    ESP_LOGI(TAG, "Flushing buffer: addr=0x%08lX, len=%lu", 
+
+    ESP_LOGI(TAG, "Flushing buffer: addr=0x%08lX, len=%lu",
              ctx->buffer_start_addr, ctx->buffer_data_len);
-    
-    // Erase pages
-    uint32_t start_page = ctx->buffer_start_addr & ~(NRF52_PAGE_SIZE - 1);
-    uint32_t end_addr = ctx->buffer_start_addr + ctx->buffer_data_len - 1;
-    uint32_t end_page = end_addr & ~(NRF52_PAGE_SIZE - 1);
-    
-    for (uint32_t page = start_page; page <= end_page; page += NRF52_PAGE_SIZE) {
-        ESP_LOGI(TAG, "Erasing page 0x%08lX", page);
-        esp_err_t ret = swd_flash_erase_page(page);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to erase page 0x%08lX", page);
-            return ret;
+
+    // Only erase if not mass erased
+    if (!g_mass_erased) {
+        uint32_t start_page = ctx->buffer_start_addr & ~(NRF52_PAGE_SIZE - 1);
+        uint32_t end_addr = ctx->buffer_start_addr + ctx->buffer_data_len - 1;
+        uint32_t end_page = end_addr & ~(NRF52_PAGE_SIZE - 1);
+
+        for (uint32_t page = start_page; page <= end_page; page += NRF52_PAGE_SIZE) {
+            ESP_LOGI(TAG, "Erasing page 0x%08lX", page);
+            esp_err_t ret = swd_flash_erase_page(page);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to erase page 0x%08lX", page);
+                return ret;  // Fail immediately
+            }
         }
+    } else {
+        ESP_LOGI(TAG, "Skipping page erases (mass erase done)");
     }
-    
-    // Write data
-    esp_err_t ret = swd_flash_write_buffer(ctx->buffer_start_addr, 
-                                           ctx->page_buffer, 
+
+    // Single write attempt, no retries
+    ESP_LOGI(TAG, "Writing %lu bytes", ctx->buffer_data_len);
+    esp_err_t ret = swd_flash_write_buffer(ctx->buffer_start_addr,
+                                           ctx->page_buffer,
                                            ctx->buffer_data_len, NULL);
+
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write buffer");
-        return ret;
+        return ret;  // Fail immediately
     }
-    
+
     ctx->flashed_bytes += ctx->buffer_data_len;
-    
+    ESP_LOGI(TAG, "Successfully flushed %lu bytes", ctx->buffer_data_len);
+
     // Clear buffer
     memset(ctx->page_buffer, 0xFF, PAGE_BUFFER_SIZE);
     ctx->buffer_data_len = 0;
-    
+
     return ESP_OK;
 }
 
@@ -174,12 +188,15 @@ static void hex_flash_callback(hex_record_t *record, uint32_t abs_addr, void *ct
         
         case HEX_TYPE_EOF:
             flush_buffer(uctx);
+            g_mass_erased = false;  // Clear flag after use
             ESP_LOGI(TAG, "Upload complete: %lu bytes flashed", uctx->flashed_bytes);
             snprintf(uctx->status_msg, sizeof(uctx->status_msg),
                     "Success: Flashed %lu bytes", uctx->flashed_bytes);
+
+            // UNCOMMENT THESE - they were working before:
             ESP_LOGI(TAG, "Flashing complete, performing reset sequence...");
-            swd_flash_reset_and_run();
-            swd_shutdown();
+            swd_flash_reset_and_run();  // <-- RESTORE THIS
+            swd_shutdown();              // <-- RESTORE THIS
             ESP_LOGI(TAG, "Target released - should now boot normally");
             break;
             
@@ -192,59 +209,6 @@ static void hex_flash_callback(hex_record_t *record, uint32_t abs_addr, void *ct
     }
 }
 
-// Dump NRF52 registers for diagnostics
-static void dump_nrf52_registers(char *buffer, size_t max_len) {
-    uint32_t val;
-    size_t offset = 0;
-    
-    ESP_LOGI(TAG, "=== NRF52 Register Dump ===");
-    
-    // Helper macro for safe string append
-    #define APPEND_REG(name, addr) do { \
-        if (swd_mem_read32(addr, &val) == ESP_OK) { \
-            ESP_LOGI(TAG, "%s: 0x%08lX", name, val); \
-            offset += snprintf(buffer + offset, max_len - offset, \
-                "\"%s\":\"0x%08lX\",", name, val); \
-        } else { \
-            ESP_LOGE(TAG, "%s: READ FAILED", name); \
-            offset += snprintf(buffer + offset, max_len - offset, \
-                "\"%s\":\"ERROR\",", name); \
-        } \
-    } while(0)
-    
-    // NVMC Registers
-    APPEND_REG("NVMC_READY", NVMC_READY);
-    APPEND_REG("NVMC_READYNEXT", NVMC_READYNEXT);
-    APPEND_REG("NVMC_CONFIG", NVMC_CONFIG);
-    
-    // UICR Registers
-    APPEND_REG("UICR_APPROTECT", UICR_APPROTECT);
-    APPEND_REG("UICR_BOOTLOADERADDR", UICR_BOOTLOADERADDR);
-    APPEND_REG("UICR_NRFFW0", UICR_NRFFW0);
-    APPEND_REG("UICR_NRFFW1", UICR_NRFFW1);
-    
-    // FICR Registers (Device Info)
-    APPEND_REG("FICR_CODEPAGESIZE", FICR_CODEPAGESIZE);
-    APPEND_REG("FICR_CODESIZE", FICR_CODESIZE);
-    APPEND_REG("FICR_DEVICEID0", FICR_DEVICEID0);
-    APPEND_REG("FICR_DEVICEID1", FICR_DEVICEID1);
-    APPEND_REG("FICR_INFO_PART", FICR_INFO_PART);
-    APPEND_REG("FICR_INFO_VARIANT", FICR_INFO_VARIANT);
-    APPEND_REG("FICR_INFO_RAM", FICR_INFO_RAM);
-    APPEND_REG("FICR_INFO_FLASH", FICR_INFO_FLASH);
-    
-    // Debug registers
-    APPEND_REG("DHCSR", DHCSR_ADDR);
-    APPEND_REG("DEMCR", DEMCR_ADDR);
-    
-    // Sample flash locations
-    APPEND_REG("Flash[0x0000]", 0x00000000);
-    APPEND_REG("Flash[0x1000]", 0x00001000);
-    
-    #undef APPEND_REG
-    
-    ESP_LOGI(TAG, "=== Register Dump Complete ===");
-}
 
 // Check SWD connection handler
 esp_err_t check_swd_handler(httpd_req_t *req) {
@@ -461,12 +425,13 @@ esp_err_t mass_erase_handler(httpd_req_t *req) {
     ret = swd_flash_disable_approtect();
     
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Mass erase successful, APPROTECT disabled");
+        g_mass_erased = true;  // Set flag
+        ESP_LOGI(TAG, "Mass erase successful, skipping page erases on next upload");
         strcpy(resp, "{\"success\":true,\"message\":\"Mass erase complete, APPROTECT disabled\"}");
     } else {
         ESP_LOGE(TAG, "Mass erase failed: %s", esp_err_to_name(ret));
-        snprintf(resp, sizeof(resp), 
-            "{\"success\":false,\"message\":\"Mass erase failed: %s\"}", 
+        snprintf(resp, sizeof(resp),
+            "{\"success\":false,\"message\":\"Mass erase failed: %s\"}",
             esp_err_to_name(ret));
     }
     
@@ -479,125 +444,220 @@ esp_err_t mass_erase_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// Upload handler
+
+// Upload handler - saves raw binary data to storage
 static esp_err_t upload_post_handler(httpd_req_t *req) {
-    char buf[1024];
+    char filepath[] = "/storage/firmware.hex";
+
+    ESP_LOGI(TAG, "Starting raw hex file upload");
+
+    // Delete old file if exists
+    unlink(filepath);
+
+    // Open in BINARY WRITE mode - critical!
+    FILE *f = fopen(filepath, "wb");  // "wb" not "w"
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for writing");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to open storage");
+        return ESP_FAIL;
+    }
+
+    uint8_t buf[1024];  // Use uint8_t for binary data
     int remaining = req->content_len;
+    int received = 0;
 
-    ESP_LOGI(TAG, "Starting hex upload: %d bytes", remaining);
+    ESP_LOGI(TAG, "Receiving %d bytes", remaining);
 
-    // Ensure SWD is ready at the start
-    esp_err_t ret = ensure_swd_ready();
-    if (ret != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SWD not ready");
-        return ESP_FAIL;
-    }
-
-    // Clean up any previous context
-    if (g_upload_ctx) {
-        if (g_upload_ctx->parser) {
-            hex_stream_free(g_upload_ctx->parser);
-        }
-        free(g_upload_ctx->page_buffer);
-        free(g_upload_ctx);
-    }
-
-    // Allocate new context
-    g_upload_ctx = calloc(1, sizeof(upload_context_t));
-    if (!g_upload_ctx) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-        return ESP_FAIL;
-    }
-
-    g_upload_ctx->page_buffer = malloc(PAGE_BUFFER_SIZE);
-    if (!g_upload_ctx->page_buffer) {
-        free(g_upload_ctx);
-        g_upload_ctx = NULL;
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-        return ESP_FAIL;
-    }
-
-    memset(g_upload_ctx->page_buffer, 0xFF, PAGE_BUFFER_SIZE);
-
-    // Parse query string for target type
-    char query[64] = {0};
-    httpd_req_get_url_query_str(req, query, sizeof(query));
-
-    if (strstr(query, "type=bootloader")) {
-        ESP_LOGI(TAG, "Flashing bootloader");
-        g_upload_ctx->start_addr = 0xFFFFFFFF;
-    } else if (strstr(query, "type=app")) {
-        g_upload_ctx->start_addr = 0x26000;
-        ESP_LOGI(TAG, "Flashing application at 0x26000");
-    } else if (strstr(query, "type=softdevice")) {
-        g_upload_ctx->start_addr = 0x1000;
-        ESP_LOGI(TAG, "Flashing SoftDevice at 0x1000");
-    } else {
-        g_upload_ctx->start_addr = 0xFFFFFFFF;
-        ESP_LOGI(TAG, "Flashing at addresses from hex file");
-    }
-
-    // Create hex parser
-    g_upload_ctx->parser = hex_stream_create(hex_flash_callback, g_upload_ctx);
-    g_upload_ctx->in_progress = true;
-    g_upload_ctx->total_bytes = remaining;
-    g_upload_ctx->received_bytes = 0;  // Initialize to 0
-    g_upload_ctx->flashed_bytes = 0;   // Initialize to 0
-
-    // Process upload
+    // Receive and save raw bytes
     while (remaining > 0) {
-        int recv_len = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)));
+        int recv_len = httpd_req_recv(req, (char*)buf, MIN(remaining, sizeof(buf)));
 
         if (recv_len <= 0) {
             if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
+                ESP_LOGW(TAG, "Socket timeout");
                 continue;
             }
-            ESP_LOGE(TAG, "Upload receive failed");
-            g_upload_ctx->error = true;
-            snprintf(g_upload_ctx->status_msg, sizeof(g_upload_ctx->status_msg),
-                    "Error: Upload failed");
-            break;
+            ESP_LOGE(TAG, "Receive failed");
+            fclose(f);
+            unlink(filepath);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload failed");
+            return ESP_FAIL;
         }
 
-        // Update received bytes BEFORE parsing
-        g_upload_ctx->received_bytes += recv_len;
+        // Write exact bytes received
+        size_t written = fwrite(buf, 1, recv_len, f);
+        if (written != (size_t)recv_len) {
+            ESP_LOGE(TAG, "File write failed");
+            fclose(f);
+            unlink(filepath);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Storage full");
+            return ESP_FAIL;
+        }
+
+        received += recv_len;
         remaining -= recv_len;
 
-        // Parse hex data
-        ret = hex_stream_parse(g_upload_ctx->parser, (uint8_t*)buf, recv_len);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Hex parse failed");
-            g_upload_ctx->error = true;
-            snprintf(g_upload_ctx->status_msg, sizeof(g_upload_ctx->status_msg),
-                    "Error: Invalid hex file");
-            break;
-        }
-
-        // Log progress every 4KB
-        if ((g_upload_ctx->received_bytes % 4096) == 0) {
-            int percent = (g_upload_ctx->received_bytes * 100) / g_upload_ctx->total_bytes;
-            ESP_LOGI(TAG, "Upload: %d%% (%lu/%lu bytes)",
-                    percent, g_upload_ctx->received_bytes, g_upload_ctx->total_bytes);
+        // Log progress
+        if ((received % 51200) == 0 || remaining == 0) {
+            int percent = (received * 100) / req->content_len;
+            ESP_LOGI(TAG, "Upload progress: %d%% (%d/%d bytes)",
+                    percent, received, req->content_len);
         }
     }
 
-    g_upload_ctx->in_progress = false;
+    fclose(f);
+
+    // Verify file
+    struct stat st;
+    stat(filepath, &st);
+    ESP_LOGI(TAG, "File saved: %ld bytes", st.st_size);
 
     // Send response
     char resp[256];
-    if (!g_upload_ctx->error) {
+    snprintf(resp, sizeof(resp),
+            "{\"status\":\"success\",\"message\":\"Upload complete\",\"size\":%ld}",
+            st.st_size);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, strlen(resp));
+
+    return ESP_OK;
+}
+
+// Handler to flash firmware from stored file
+static esp_err_t flash_stored_handler(httpd_req_t *req) {
+    char filepath[] = "/storage/firmware.hex";
+
+    ESP_LOGI(TAG, "Starting flash from stored file");
+
+    // Check file exists
+    struct stat st;
+    if (stat(filepath, &st) != 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No firmware file found");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Firmware file size: %ld bytes", st.st_size);
+
+    // Set status
+    g_flash_in_progress = true;
+    g_flash_percent = 0;
+    strcpy(g_flash_status, "Starting flash...");
+
+    // Send immediate response before flashing
+    httpd_resp_sendstr(req, "{\"status\":\"started\",\"message\":\"Flashing started\"}");
+
+    // Open file
+    FILE *f = fopen(filepath, "rb");
+    if (!f) {
+        ESP_LOGE(TAG, "Failed to open firmware file");
+        strcpy(g_flash_status, "Failed to open file");
+        g_flash_in_progress = false;
+        return ESP_FAIL;
+    }
+
+    // Initialize SWD
+    esp_err_t ret = ensure_swd_ready();
+    if (ret != ESP_OK) {
+        fclose(f);
+        ESP_LOGE(TAG, "SWD not ready");
+        strcpy(g_flash_status, "SWD not ready");
+        g_flash_in_progress = false;
+        return ESP_FAIL;
+    }
+
+    // Create upload context
+    upload_context_t *ctx = calloc(1, sizeof(upload_context_t));
+    ctx->page_buffer = malloc(PAGE_BUFFER_SIZE);
+    memset(ctx->page_buffer, 0xFF, PAGE_BUFFER_SIZE);
+    ctx->parser = hex_stream_create(hex_flash_callback, ctx);
+    ctx->start_addr = 0xFFFFFFFF;
+
+    // Read and parse file in chunks
+    uint8_t read_buffer[1024];
+    size_t bytes_read;
+    size_t total_read = 0;
+
+    while ((bytes_read = fread(read_buffer, 1, sizeof(read_buffer), f)) > 0) {
+        // Pass raw data directly to the stream parser
+        ret = hex_stream_parse(ctx->parser, read_buffer, bytes_read);
+
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Hex parse failed at byte %zu", total_read);
+            strcpy(g_flash_status, "Flash failed");
+            g_flash_in_progress = false;
+            break;
+        }
+
+        total_read += bytes_read;
+
+        // Update global status
+        g_flash_percent = (total_read * 100) / st.st_size;
+        snprintf(g_flash_status, sizeof(g_flash_status),
+                "Flashing: %d%% (%lu bytes)", g_flash_percent, ctx->flashed_bytes);
+
+        // Progress log every 50KB
+        if ((total_read % 51200) == 0 || total_read == (size_t)st.st_size) {
+            ESP_LOGI(TAG, "Processing: %d%% (%zu/%ld bytes), flashed %lu bytes",
+                    g_flash_percent, total_read, st.st_size, ctx->flashed_bytes);
+        }
+
+        // Yield to prevent watchdog
+        vTaskDelay(1);
+    }
+
+    fclose(f);
+
+    ESP_LOGI(TAG, "Flash complete: %lu bytes flashed from %zu byte file",
+            ctx->flashed_bytes, total_read);
+
+    // Set final status
+    if (ret == ESP_OK) {
+        snprintf(g_flash_status, sizeof(g_flash_status),
+                "Flash complete: %lu bytes", ctx->flashed_bytes);
+    }
+    g_flash_in_progress = false;
+
+    // Cleanup
+    if (ctx->parser) hex_stream_free(ctx->parser);
+    free(ctx->page_buffer);
+    free(ctx);
+
+    // Delete file to free storage space
+    unlink(filepath);
+    ESP_LOGI(TAG, "Firmware file deleted");
+
+    return ESP_OK;
+}
+
+// Handler to check if firmware file exists
+static esp_err_t check_stored_handler(httpd_req_t *req) {
+    char filepath[] = "/storage/firmware.hex";
+    struct stat st;
+
+    char resp[256];
+    if (stat(filepath, &st) == 0) {
         snprintf(resp, sizeof(resp),
-                "{\"status\":\"success\",\"message\":\"%s\"}",
-                g_upload_ctx->status_msg);
+                "{\"exists\":true,\"size\":%ld}", st.st_size);
     } else {
-        snprintf(resp, sizeof(resp),
-                "{\"status\":\"error\",\"message\":\"%s\"}",
-                g_upload_ctx->status_msg);
+        strcpy(resp, "{\"exists\":false}");
     }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, strlen(resp));
+    return ESP_OK;
+}
 
+// Handler to get flash status
+static esp_err_t flash_status_handler(httpd_req_t *req) {
+    char resp[256];
+    snprintf(resp, sizeof(resp),
+            "{\"in_progress\":%s,\"percent\":%d,\"status\":\"%s\"}",
+            g_flash_in_progress ? "true" : "false",
+            g_flash_percent,
+            g_flash_status);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, strlen(resp));
     return ESP_OK;
 }
 
@@ -694,6 +754,28 @@ esp_err_t erase_all_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Add this handler for target reset
+static esp_err_t reset_target_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "Target reset requested");
+
+    char resp[128];
+    esp_err_t ret = swd_flash_reset_and_run();
+
+    if (ret == ESP_OK) {
+        strcpy(resp, "{\"success\":true,\"message\":\"Target reset\"}");
+    } else {
+        strcpy(resp, "{\"success\":false,\"message\":\"Reset failed\"}");
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, strlen(resp));
+
+    // Clean up SWD after sending response
+    swd_shutdown();
+
+    return ESP_OK;
+}
+
 // Register all handlers
 esp_err_t register_upload_handlers(httpd_handle_t server) {
     httpd_uri_t upload_uri = {
@@ -702,7 +784,28 @@ esp_err_t register_upload_handlers(httpd_handle_t server) {
         .handler = upload_post_handler,
         .user_ctx = NULL
     };
-    
+
+    httpd_uri_t flash_stored_uri = {
+        .uri = "/flash_stored",
+        .method = HTTP_POST,
+        .handler = flash_stored_handler,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t check_stored_uri = {
+        .uri = "/check_stored",
+        .method = HTTP_GET,
+        .handler = check_stored_handler,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t flash_status_uri = {
+        .uri = "/flash_status",
+        .method = HTTP_GET,
+        .handler = flash_status_handler,
+        .user_ctx = NULL
+    };
+
     httpd_uri_t progress_uri = {
         .uri = "/progress",
         .method = HTTP_GET,
@@ -716,19 +819,30 @@ esp_err_t register_upload_handlers(httpd_handle_t server) {
         .handler = check_swd_handler,
         .user_ctx = NULL
     };
-    
+
     httpd_uri_t mass_erase_uri = {
         .uri = "/mass_erase",
         .method = HTTP_GET,
         .handler = mass_erase_handler,
         .user_ctx = NULL
     };
-    
+
+    httpd_uri_t reset_uri = {
+        .uri = "/reset_target",
+        .method = HTTP_POST,
+        .handler = reset_target_handler,
+        .user_ctx = NULL
+    };
+
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &upload_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &flash_stored_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &check_stored_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &flash_status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &progress_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &check_swd_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &mass_erase_uri));
-    
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &reset_uri));
+
     ESP_LOGI(TAG, "All handlers registered");
     return ESP_OK;
 }

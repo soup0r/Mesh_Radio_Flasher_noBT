@@ -19,6 +19,7 @@
 #include "esp_http_server.h"
 #include "web_upload.h"
 #include "web_server.h"
+#include "esp_spiffs.h"
 
 // Custom modules
 #include "swd_core.h"
@@ -72,6 +73,7 @@ static uint32_t recovery_count = 0;
 
 // Function declarations
 static void init_system(void);
+static void init_storage(void);
 static void system_health_task(void *arg);
 static esp_err_t try_swd_connection(void);
 static void handle_critical_error(const char *context, esp_err_t error);
@@ -85,6 +87,26 @@ static esp_err_t release_swd_handler(httpd_req_t *req);
 static void init_config(void) {
     strcpy(sys_config.wifi_ssid, WIFI_SSID);
     strcpy(sys_config.wifi_password, WIFI_PASSWORD);
+}
+
+// Initialize SPIFFS storage partition
+static void init_storage(void) {
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/storage",
+        .partition_label = "storage",
+        .max_files = 2,
+        .format_if_mount_failed = true
+    };
+
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount SPIFFS (%s)", esp_err_to_name(ret));
+        return;
+    }
+
+    size_t total = 0, used = 0;
+    esp_spiffs_info(conf.partition_label, &total, &used);
+    ESP_LOGI(TAG, "Storage partition: %d bytes total, %d bytes used", total, used);
 }
 
 // Enhanced web server handler with new tabbed interface
@@ -695,20 +717,57 @@ static esp_err_t root_handler(httpd_req_t *req) {
         ""
         "function uploadFirmware() {"
         "  const file = document.getElementById('hexFile').files[0];"
-        "  const type = document.getElementById('fwType').value;"
         "  if (!file) {"
         "    alert('Please select a hex file');"
         "    return;"
         "  }"
         "  document.querySelector('#uploadBtn').disabled = true;"
-        "  document.getElementById('status').innerText = 'Starting upload...';"
+        "  document.getElementById('status').innerText = 'Uploading firmware...';"
         "  document.getElementById('progressBar').style.width = '0%';"
-        "  progressTimer = setInterval(updateProgress, 500);"
+        "  "
         "  const xhr = new XMLHttpRequest();"
-        "  xhr.onload = function() {"
-        "    updateProgress();"
+        "  "
+        "  xhr.upload.onprogress = function(e) {"
+        "    if (e.lengthComputable) {"
+        "      const percent = Math.round((e.loaded / e.total) * 100);"
+        "      document.getElementById('progressBar').style.width = percent + '%';"
+        "      document.getElementById('status').innerText = 'Uploading: ' + percent + '%';"
+        "    }"
         "  };"
-        "  xhr.open('POST', '/upload?type=' + type);"
+        "  "
+        "  xhr.onload = async function() {"
+        "    if (xhr.status === 200) {"
+        "      document.getElementById('status').innerText = 'Upload complete, starting flash...';"
+        "      "
+        "      await fetch('/flash_stored', {method: 'POST'});"
+        "      "
+        "      const pollInterval = setInterval(async function() {"
+        "        const statusResp = await fetch('/flash_status');"
+        "        const status = await statusResp.json();"
+        "        "
+        "        document.getElementById('progressBar').style.width = status.percent + '%';"
+        "        document.getElementById('status').innerText = status.status;"
+        "        "
+        "        if (!status.in_progress) {"
+        "          clearInterval(pollInterval);"
+        "          if (status.status.includes('complete')) {"
+        "            document.getElementById('status').innerText = '✓ ' + status.status;"
+        "          }"
+        "          document.querySelector('#uploadBtn').disabled = false;"
+        "        }"
+        "      }, 1000);"
+        "    } else {"
+        "      document.getElementById('status').innerText = 'Upload failed';"
+        "      document.querySelector('#uploadBtn').disabled = false;"
+        "    }"
+        "  };"
+        "  "
+        "  xhr.onerror = function() {"
+        "    document.getElementById('status').innerText = 'Upload error';"
+        "    document.querySelector('#uploadBtn').disabled = false;"
+        "  };"
+        "  "
+        "  xhr.open('POST', '/upload');"
         "  xhr.send(file);"
         "}"
         ""
@@ -773,15 +832,16 @@ static esp_err_t root_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// Update start_webserver() to register these handlers:
 static esp_err_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.max_uri_handlers = 30;
     config.recv_wait_timeout = 10;
-    config.stack_size = 8192;
-    
+    config.send_wait_timeout = 10;
+    config.stack_size = 10240;
+
     if (httpd_start(&web_server, &config) == ESP_OK) {
+        // Register handlers
         httpd_uri_t root_uri = {
             .uri = "/",
             .method = HTTP_GET,
@@ -795,21 +855,16 @@ static esp_err_t start_webserver(void) {
             .handler = release_swd_handler,
             .user_ctx = NULL
         };
-        httpd_register_uri_handler(web_server, &release_uri);
-        
+
         httpd_register_uri_handler(web_server, &root_uri);
-        
-        // This registers all the upload-related handlers including mass_erase
+        httpd_register_uri_handler(web_server, &release_uri);
         register_upload_handlers(web_server);
-
-        // Register power control handlers
         register_power_handlers(web_server);
-
 
         ESP_LOGI(TAG, "Web server started successfully");
         return ESP_OK;
     }
-    
+
     ESP_LOGE(TAG, "Failed to start web server");
     return ESP_FAIL;
 }
@@ -1229,6 +1284,10 @@ void app_main(void) {
 
     // Update global IP
     device_ip = (char*)ip;
+
+    // Initialize SPIFFS storage
+    ESP_LOGI(TAG, "Initializing storage...");
+    init_storage();
 
     // Start web server
     ESP_LOGI(TAG, "Starting web server...");

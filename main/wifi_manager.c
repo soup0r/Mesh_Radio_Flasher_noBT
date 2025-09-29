@@ -134,6 +134,10 @@ static esp_err_t try_wifi_mode(const char* ssid, const char* password, bool is_l
         }
     }
 
+    // CRITICAL: Disable power save for LR mode stability
+    esp_err_t ps_ret = esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_LOGI(TAG, "WiFi power save disabled: %s", esp_err_to_name(ps_ret));
+
     // Small delay before connect
     vTaskDelay(pdMS_TO_TICKS(100));
 
