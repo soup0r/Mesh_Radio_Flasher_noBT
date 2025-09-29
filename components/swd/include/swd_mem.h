@@ -32,24 +32,8 @@ esp_err_t swd_mem_write32(uint32_t addr, uint32_t data);
 
 // Multiple word access (auto-increment)
 esp_err_t swd_mem_read_buffer(uint32_t addr, uint8_t *buffer, uint32_t size);
-esp_err_t swd_mem_write_buffer(uint32_t addr, const uint8_t *buffer, uint32_t size);
 
-// Verify memory
-esp_err_t swd_mem_verify(uint32_t addr, const uint8_t *expected, uint32_t size);
-
-// Fill memory with pattern
-esp_err_t swd_mem_fill(uint32_t addr, uint32_t pattern, uint32_t count);
-
-// Core registers access
-esp_err_t swd_read_core_register(uint32_t reg, uint32_t *value);
-esp_err_t swd_write_core_register(uint32_t reg, uint32_t value);
-
-// Halt/Resume core
-esp_err_t swd_halt_core(void);
-esp_err_t swd_resume_core(void);
-bool swd_is_halted(void);
-
-// Add this line to components/swd/include/swd_mem.h
+// Block write for optimized flash programming
 esp_err_t swd_mem_write_block32(uint32_t addr, const uint32_t *data, uint32_t count);
 
 // System control registers

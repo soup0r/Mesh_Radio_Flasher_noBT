@@ -191,7 +191,7 @@ cleanup:
 }
 
 // Optimized single word write
-esp_err_t swd_flash_write_word(uint32_t addr, uint32_t data) {
+static esp_err_t swd_flash_write_word(uint32_t addr, uint32_t data) {
     if (addr & 0x3) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -206,8 +206,7 @@ esp_err_t swd_flash_write_word(uint32_t addr, uint32_t data) {
 }
 
 // Fast flash write with proper alignment handling
-esp_err_t swd_flash_write_buffer(uint32_t addr, const uint8_t *data, uint32_t size, 
-                                 flash_progress_cb progress) {
+esp_err_t swd_flash_write_buffer(uint32_t addr, const uint8_t *data, uint32_t size) {
     if (!data || size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -284,11 +283,6 @@ esp_err_t swd_flash_write_buffer(uint32_t addr, const uint8_t *data, uint32_t si
         data += bytes_written;
         written += bytes_written;
         size -= bytes_written;
-        
-        // Report progress
-        if (progress && (written & 0xFFF) == 0) {  // Every 4KB
-            progress(written, written + size, "Writing");
-        }
     }
     
     free(word_buffer);
@@ -313,11 +307,7 @@ esp_err_t swd_flash_write_buffer(uint32_t addr, const uint8_t *data, uint32_t si
         if (ready & 0x1) break;
         vTaskDelay(1);
     }
-    
-    if (progress) {
-        progress(written, written, "Complete");
-    }
-    
+
 cleanup:
     // Return to read mode
     swd_mem_write32(NVMC_CONFIG, NVMC_CONFIG_REN);
@@ -328,67 +318,6 @@ cleanup:
             written, elapsed_ms, speed_kbps);
     
     return ret;
-}
-
-// Mass erase
-esp_err_t swd_flash_mass_erase_ctrl_ap(void) {
-    // Just call the main implementation
-    return swd_flash_disable_approtect();
-}
-
-// High-level firmware update
-esp_err_t swd_flash_update_firmware(const firmware_update_t *update) {
-    if (!update || !update->data || update->size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    ESP_LOGI(TAG, "Firmware update: addr=0x%08lX size=%lu verify=%d", 
-             update->start_addr, update->size, update->verify);
-    
-    // Calculate pages to erase
-    uint32_t start_page = update->start_addr / NRF52_FLASH_PAGE_SIZE;
-    uint32_t end_addr = update->start_addr + update->size - 1;
-    uint32_t end_page = end_addr / NRF52_FLASH_PAGE_SIZE;
-    uint32_t page_count = end_page - start_page + 1;
-    
-    ESP_LOGI(TAG, "Erasing %lu pages", page_count);
-    
-    // Erase required pages
-    for (uint32_t page = start_page; page <= end_page; page++) {
-        esp_err_t ret = swd_flash_erase_page(page * NRF52_FLASH_PAGE_SIZE);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to erase page %lu", page);
-            return ret;
-        }
-        
-        if (update->progress) {
-            uint32_t progress = ((page - start_page) * 100) / page_count;
-            update->progress(progress, 100, "Erasing");
-        }
-    }
-    
-    // Write firmware
-    ESP_LOGI(TAG, "Writing firmware");
-    esp_err_t ret = swd_flash_write_buffer(update->start_addr, update->data, 
-                                           update->size, update->progress);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to write firmware");
-        return ret;
-    }
-    
-    // Verify if requested
-    if (update->verify) {
-        ESP_LOGI(TAG, "Verifying firmware");
-        ret = swd_flash_verify(update->start_addr, update->data, 
-                              update->size, update->progress);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Firmware verification failed");
-            return ret;
-        }
-    }
-    
-    ESP_LOGI(TAG, "Firmware update complete");
-    return ESP_OK;
 }
 
 esp_err_t swd_flash_init(void) {
@@ -583,34 +512,6 @@ esp_err_t swd_flash_disable_approtect(void) {
     
     ESP_LOGW(TAG, "=== Mass Erase Complete ===");
     return ESP_OK;
-}
-
-// Full chip erase (except UICR)
-esp_err_t swd_flash_erase_all(void) {
-    ESP_LOGW(TAG, "Starting full chip erase...");
-    
-    esp_err_t ret = wait_nvmc_ready(100);
-    if (ret != ESP_OK) return ret;
-    
-    ret = set_nvmc_config(NVMC_CONFIG_EEN);
-    if (ret != ESP_OK) return ret;
-    
-    ret = swd_mem_write32(NVMC_ERASEALL, 0x1);
-    if (ret != ESP_OK) {
-        set_nvmc_config(NVMC_CONFIG_REN);
-        return ret;
-    }
-    
-    // Full erase takes 200-300ms
-    ESP_LOGI(TAG, "Erasing... (this takes ~300ms)");
-    ret = wait_nvmc_ready(500);
-    set_nvmc_config(NVMC_CONFIG_REN);
-    
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Full chip erase complete");
-    }
-
-    return ret;
 }
 
 esp_err_t swd_flash_reset_and_run(void) {

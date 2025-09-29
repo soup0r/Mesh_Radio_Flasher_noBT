@@ -16,7 +16,6 @@
 
 static const char *TAG = "POWER_MGMT";
 static power_config_t power_config = {0};
-static system_state_t current_state = SYSTEM_STATE_INIT;
 static system_health_t health_stats = {0};
 static bool power_state = true;
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
@@ -159,7 +158,6 @@ esp_err_t power_mgmt_init(const power_config_t *config) {
         return ESP_ERR_INVALID_ARG;
     }
     power_config = *config;
-    current_state = SYSTEM_STATE_INIT;
 
     // Check if we're waking from deep sleep
     esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
@@ -199,7 +197,6 @@ esp_err_t power_mgmt_init(const power_config_t *config) {
     }
 
     power_battery_init();
-    current_state = SYSTEM_STATE_ACTIVE;
     ESP_LOGI(TAG, "Power management initialized");
     return ESP_OK;
 }
@@ -327,15 +324,6 @@ void power_restore_after_sleep(void) {
     }
 }
 
-esp_err_t power_enter_deep_sleep(uint32_t duration_sec) {
-    ESP_LOGI(TAG, "Entering deep sleep for %lu seconds", (unsigned long)duration_sec);
-    power_prepare_for_sleep();
-    current_state = SYSTEM_STATE_DEEP_SLEEP;
-    esp_sleep_enable_timer_wakeup(duration_sec * 1000000ULL);
-    esp_deep_sleep_start();
-    return ESP_OK;
-}
-
 void power_watchdog_feed(void) {}
 
 void power_get_health_status(system_health_t *health) {
@@ -359,110 +347,6 @@ wake_reason_t power_get_wake_reason(void) {
     }
 }
 
-esp_err_t power_log_error(const char *error_msg) {
-    if (!error_msg) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    ESP_LOGE(TAG, "Error logged: %s", error_msg);
-    nvs_handle_t nvs;
-    esp_err_t ret = nvs_open("error_log", NVS_READWRITE, &nvs);
-    if (ret == ESP_OK) {
-        nvs_set_str(nvs, "last_error", error_msg);
-        nvs_commit(nvs);
-        nvs_close(nvs);
-    }
-    return ESP_OK;
-}
-
-esp_err_t power_schedule_sleep(void) {
-    return ESP_OK;
-}
-
-void power_cancel_sleep(void) {}
-
-bool power_should_stay_awake(void) {
-    return current_state == SYSTEM_STATE_ACTIVE;
-}
-
-esp_err_t power_watchdog_init(uint32_t timeout_sec) {
-    ESP_LOGI(TAG, "Watchdog initialized with %lu second timeout", (unsigned long)timeout_sec);
-    return ESP_OK;
-}
-
-void power_watchdog_disable(void) {}
-
-esp_err_t power_recovery_init(void) {
-    return ESP_OK;
-}
-
-esp_err_t power_handle_error(esp_err_t error, const char *context) {
-    ESP_LOGE(TAG, "Error %s in context: %s", esp_err_to_name(error), context);
-    health_stats.total_resets++;
-    current_state = SYSTEM_STATE_ERROR;
-    return ESP_OK;
-}
-
-esp_err_t power_self_test(void) {
-    ESP_LOGI(TAG, "Running self-test");
-    if (power_config.target_power_gpio >= 0) {
-        ESP_LOGI(TAG, "Testing power control on GPIO%d", power_config.target_power_gpio);
-        int current = gpio_get_level((gpio_num_t)power_config.target_power_gpio);
-        ESP_LOGI(TAG, "Current power state: %s (GPIO=%d)",
-                current ? "OFF" : "ON", current);
-    }
-    return ESP_OK;
-}
-
-esp_err_t power_get_last_errors(char *buffer, size_t size) {
-    if (!buffer || size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    nvs_handle_t nvs;
-    esp_err_t ret = nvs_open("error_log", NVS_READONLY, &nvs);
-    if (ret == ESP_OK) {
-        size_t length = size;
-        ret = nvs_get_str(nvs, "last_error", buffer, &length);
-        nvs_close(nvs);
-    }
-    return ret;
-}
-
-void power_clear_error_log(void) {
-    nvs_handle_t nvs;
-    if (nvs_open("error_log", NVS_READWRITE, &nvs) == ESP_OK) {
-        nvs_erase_all(nvs);
-        nvs_commit(nvs);
-        nvs_close(nvs);
-    }
-}
-
-system_state_t power_get_state(void) {
-    return current_state;
-}
-
-const char* power_get_state_string(system_state_t state) {
-    switch(state) {
-        case SYSTEM_STATE_INIT: return "INIT";
-        case SYSTEM_STATE_ACTIVE: return "ACTIVE";
-        case SYSTEM_STATE_IDLE: return "IDLE";
-        case SYSTEM_STATE_ERROR: return "ERROR";
-        case SYSTEM_STATE_RECOVERY: return "RECOVERY";
-        case SYSTEM_STATE_DEEP_SLEEP: return "DEEP_SLEEP";
-        default: return "UNKNOWN";
-    }
-}
-
-float power_get_battery_voltage(void) {
-    battery_status_t status;
-    if (power_get_battery_status(&status) == ESP_OK) {
-        return status.voltage;
-    }
-    return 0.0f;
-}
-
-float power_get_current_draw(void) {
-    return 0.0f;
-}
 
 // WiFi connection info functions
 void power_set_wifi_info(bool is_lr, const char* ssid) {
@@ -710,24 +594,6 @@ esp_err_t power_restore_from_deep_sleep(void) {
     return ESP_OK;
 }
 
-// Check if we should enter deep sleep
-bool power_should_enter_deep_sleep(bool wifi_connected_param) {
-    if (!ENABLE_DEEP_SLEEP_POWER_MGMT) {
-        return false;
-    }
-
-    // Only used for critical battery shutdown now
-    battery_status_t battery;
-    power_get_battery_status(&battery);
-
-    if (battery.voltage < BATTERY_CRITICAL_THRESHOLD) {
-        ESP_LOGW(TAG, "Critical battery - must sleep");
-        return true;
-    }
-
-    // For normal operation, sleep is triggered by WiFi disconnect
-    return !wifi_connected_param;
-}
 
 // Helper functions
 uint32_t power_get_wake_count(void) {
@@ -737,14 +603,4 @@ uint32_t power_get_wake_count(void) {
 void power_reset_wake_count(void) {
     wake_count = 0;
     rtc_wake_count = 0;
-}
-
-
-// Get total nRF52 off time (for monitoring/debugging)
-uint64_t power_get_nrf_off_time_ms(void) {
-    return rtc_nrf_off_total_ms;
-}
-
-bool power_is_nrf_power_off_active(void) {
-    return rtc_nrf_power_off_active;
 }

@@ -282,17 +282,10 @@ bool wifi_manager_is_connected(void) {
     return current_state == WIFI_STATE_CONNECTED;
 }
 
-wifi_state_t wifi_manager_get_state(void) {
+static wifi_state_t wifi_manager_get_state(void) {
     return current_state;
 }
 
 const char* wifi_manager_get_ip(void) {
     return current_ip;
-}
-
-void wifi_manager_shutdown(void) {
-    if (wifi_initialized) {
-        esp_wifi_stop();
-        wifi_initialized = false;
-    }
 }

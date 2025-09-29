@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "src/power_mgmt.c"
     INCLUDE_DIRS "include"
-    REQUIRES driver nvs_flash esp_wifi esp_timer swd esp_adc main
+    REQUIRES driver nvs_flash esp_timer esp_adc main
 )
 
 # Include the main directory where config.h is located

@@ -10,15 +10,16 @@ typedef enum {
     WIFI_STATE_CONNECTED
 } wifi_state_t;
 
+// WiFi manager initialization and control
 esp_err_t wifi_manager_init(void);
 esp_err_t wifi_manager_connect(void);
 void wifi_manager_disconnect_handler(void);
 bool wifi_manager_is_connected(void);
-wifi_state_t wifi_manager_get_state(void);
 const char* wifi_manager_get_ip(void);
-void wifi_manager_shutdown(void);
 
-// External function from main.c for web server cleanup
+// External function from main.c for web server cleanup during disconnect
+// Note: This creates an explicit dependency on main.c's stop_webserver()
+// Used to cleanly shut down the web server before entering deep sleep
 extern void stop_webserver(void);
 
 #endif

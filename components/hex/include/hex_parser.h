@@ -36,13 +36,7 @@ hex_stream_parser_t* hex_stream_create(hex_record_callback_t callback, void *use
 // Parse chunk of hex data
 esp_err_t hex_stream_parse(hex_stream_parser_t *parser, const uint8_t *data, size_t len);
 
-// Reset parser for new file
-void hex_stream_reset(hex_stream_parser_t *parser);
-
 // Free parser
 void hex_stream_free(hex_stream_parser_t *parser);
-
-// Get current extended address
-uint32_t hex_stream_get_base_addr(hex_stream_parser_t *parser);
 
 #endif

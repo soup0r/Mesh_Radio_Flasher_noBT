@@ -12,8 +12,6 @@
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
-#include "driver/rtc_io.h"
-#include "esp_mac.h"
 #include "nrf52_hal.h"
 #include "config.h"
 #include "esp_http_server.h"
@@ -26,7 +24,6 @@
 #include "swd_mem.h"
 #include "swd_flash.h"
 #include "power_mgmt.h"
-#include "flash_safety.h"
 #include "wifi_manager.h"
 
 
@@ -34,60 +31,25 @@ static const char *TAG = "FLASHER";
 
 // Event group for system state
 static EventGroupHandle_t system_events;
-#define WIFI_CONNECTED_BIT  BIT0
 #define SWD_CONNECTED_BIT   BIT1
-#define FLASH_BUSY_BIT      BIT2
-#define ERROR_STATE_BIT     BIT3
-#define RECOVERY_MODE_BIT   BIT4
 
 // Global variables
 static char* device_ip = "Not connected";
 static httpd_handle_t web_server = NULL;
-static uint32_t wake_count = 0;
-
-// System configuration
-typedef struct {
-    char wifi_ssid[32];
-    char wifi_password[64];
-    uint32_t sleep_timeout_sec;
-    uint32_t watchdog_timeout_sec;
-    bool auto_recovery;
-    bool deep_sleep_enabled;
-} system_config_t;
-
-static system_config_t sys_config = {
-    .wifi_ssid = "",
-    .wifi_password = "",
-    .sleep_timeout_sec = 300,
-    .watchdog_timeout_sec = 0,
-    .auto_recovery = true,
-    .deep_sleep_enabled = false
-};
 
 // Global state
 static bool swd_initialized = false;
-static esp_timer_handle_t watchdog_timer __attribute__((unused)) = NULL;
-static esp_timer_handle_t sleep_timer __attribute__((unused)) = NULL;
-static uint32_t error_count = 0;
-static uint32_t recovery_count = 0;
 
 // Function declarations
 static void init_system(void);
 static void init_storage(void);
 static void system_health_task(void *arg);
 static esp_err_t try_swd_connection(void);
-static void handle_critical_error(const char *context, esp_err_t error);
 static void test_swd_functions(void);
 static void test_memory_regions(void);
 static esp_err_t start_webserver(void);
 void stop_webserver(void);  // Made global for wifi_manager cleanup
 static esp_err_t release_swd_handler(httpd_req_t *req);
-
-// Initialize configuration from config.h
-static void init_config(void) {
-    strcpy(sys_config.wifi_ssid, WIFI_SSID);
-    strcpy(sys_config.wifi_password, WIFI_PASSWORD);
-}
 
 // Initialize SPIFFS storage partition
 static void init_storage(void) {
@@ -739,7 +701,7 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "    if (xhr.status === 200) {"
         "      document.getElementById('status').innerText = 'Upload complete, starting flash...';"
         "      "
-        "      await fetch('/flash_stored', {method: 'POST'});"
+        "      fetch('/flash_stored', {method: 'POST'});"
         "      "
         "      const pollInterval = setInterval(async function() {"
         "        const statusResp = await fetch('/flash_status');"
@@ -1125,9 +1087,9 @@ static void system_health_task(void *arg) {
     
     // Do initial system check
     power_get_health_status(&health);
-    ESP_LOGI(TAG, "Initial Health: SWD=%d Flash=%d Net=%d Errors=%lu",
-            health.swd_failures, health.flash_failures, 
-            health.network_failures, error_count);
+    ESP_LOGI(TAG, "Initial Health: SWD=%d Flash=%d Net=%d",
+            health.swd_failures, health.flash_failures,
+            health.network_failures);
     
     size_t free_heap = esp_get_free_heap_size();
     ESP_LOGI(TAG, "Heap: free=%d", free_heap);
@@ -1144,24 +1106,6 @@ static void system_health_task(void *arg) {
     }
 }
 
-// Critical error handler
-__attribute__((unused))
-static void handle_critical_error(const char *context, esp_err_t error) {
-    ESP_LOGE(TAG, "Critical error in %s: %s", context, esp_err_to_name(error));
-    recovery_count++;
-    
-    char error_msg[128];
-    snprintf(error_msg, sizeof(error_msg), "%s: %s", context, esp_err_to_name(error));
-    power_log_error(error_msg);
-    
-    if (recovery_count > 3) {
-        ESP_LOGE(TAG, "Too many recovery attempts");
-        xEventGroupSetBits(system_events, RECOVERY_MODE_BIT);
-    }
-}
-
-
-// System initialization
 // System initialization
 static void init_system(void) {
     // CRITICAL: NVS must be initialized before other systems
@@ -1173,7 +1117,6 @@ static void init_system(void) {
     ESP_ERROR_CHECK(ret);
     ESP_LOGI(TAG, "NVS Flash initialized");
 
-    init_config();
     system_events = xEventGroupCreate();
 
     power_config_t power_cfg = {
@@ -1221,10 +1164,8 @@ void app_main(void) {
     // Check and log wake reason
     esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
     if (wake_cause == ESP_SLEEP_WAKEUP_TIMER) {
-        wake_count = power_get_wake_count() + 1;
-        ESP_LOGI(TAG, "=== Woke from deep sleep (count: %lu) ===", wake_count);
+        ESP_LOGI(TAG, "=== Woke from deep sleep (count: %lu) ===", power_get_wake_count());
     } else {
-        wake_count = 0;
         ESP_LOGI(TAG, "=== Fresh boot (power on) ===");
     }
 

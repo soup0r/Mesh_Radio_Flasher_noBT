@@ -164,20 +164,6 @@ esp_err_t hex_stream_parse(hex_stream_parser_t *parser, const uint8_t *data, siz
     return ESP_OK;
 }
 
-void hex_stream_reset(hex_stream_parser_t *parser) {
-    if (parser) {
-        parser->extended_addr = 0;
-        parser->segment_addr = 0;
-        parser->line_pos = 0;
-        parser->line_count = 0;
-        parser->data_bytes = 0;
-    }
-}
-
 void hex_stream_free(hex_stream_parser_t *parser) {
     free(parser);
-}
-
-uint32_t hex_stream_get_base_addr(hex_stream_parser_t *parser) {
-    return parser ? (parser->extended_addr + parser->segment_addr) : 0;
 }

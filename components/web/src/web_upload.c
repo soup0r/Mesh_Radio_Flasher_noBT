@@ -135,7 +135,7 @@ static esp_err_t flush_buffer(upload_context_t *ctx) {
     ESP_LOGI(TAG, "Writing %lu bytes", ctx->buffer_data_len);
     esp_err_t ret = swd_flash_write_buffer(ctx->buffer_start_addr,
                                            ctx->page_buffer,
-                                           ctx->buffer_data_len, NULL);
+                                           ctx->buffer_data_len);
 
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write buffer");
@@ -702,8 +702,8 @@ esp_err_t disable_protection_handler(httpd_req_t *req) {
         return ESP_OK;
     }
     
-    // Call the new CTRL-AP mass erase function
-    esp_err_t ret = swd_flash_mass_erase_ctrl_ap();
+    // Perform mass erase via CTRL-AP
+    esp_err_t ret = swd_flash_disable_approtect();
     
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "✓ Mass erase successful");
@@ -736,8 +736,8 @@ esp_err_t erase_all_handler(httpd_req_t *req) {
         return ESP_OK;
     }
     
-    // Use the same CTRL-AP mass erase for full chip erase
-    esp_err_t ret = swd_flash_mass_erase_ctrl_ap();
+    // Perform mass erase via CTRL-AP
+    esp_err_t ret = swd_flash_disable_approtect();
     
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "✓ Chip erase successful");

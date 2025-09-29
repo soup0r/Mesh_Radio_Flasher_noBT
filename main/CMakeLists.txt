@@ -4,10 +4,7 @@ idf_component_register(
     REQUIRES
         swd
         power
-        safety
         web
-        hex
-        utils
         nvs_flash
         esp_wifi
         driver
