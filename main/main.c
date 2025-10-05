@@ -40,6 +40,11 @@ static httpd_handle_t web_server = NULL;
 // Global state
 static bool swd_initialized = false;
 
+// Failsafe reboot timer (CRITICAL: ensures device returns to sleep/wake cycle)
+static TaskHandle_t failsafe_task_handle = NULL;
+static bool failsafe_armed = false;
+static uint32_t failsafe_start_time = 0;
+
 // Function declarations
 static void init_system(void);
 static void init_storage(void);
@@ -1141,6 +1146,18 @@ static void init_system(void) {
     try_swd_connection();
 
     xTaskCreate(system_health_task, "health", 4096, NULL, 5, NULL);
+
+    // ========================================================================
+    // Initialize hardware watchdog last (after all other initialization)
+    // This ensures we don't get false triggers during startup
+    // ========================================================================
+    // ESP_LOGI(TAG, "Initializing hardware watchdog...");
+    // esp_err_t wdt_ret = power_init_hardware_watchdog();
+    // if (wdt_ret == ESP_OK) {
+    //     ESP_LOGI(TAG, "Hardware watchdog initialized successfully");
+    // } else {
+    //     ESP_LOGW(TAG, "Hardware watchdog initialization failed - continuing without it");
+    // }
 }
 
 static esp_err_t release_swd_handler(httpd_req_t *req) {
@@ -1153,6 +1170,135 @@ static esp_err_t release_swd_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// =============================================================================
+// FAILSAFE TIMER IMPLEMENTATION
+// =============================================================================
+
+/**
+ * @brief High-priority task that forces reboot after configured timeout
+ */
+static void failsafe_reboot_task(void *arg) {
+    uint32_t timeout_sec = *((uint32_t*)arg);
+    uint32_t elapsed_sec = 0;
+
+    ESP_LOGW(TAG, "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGW(TAG, "║  FAILSAFE TIMER ARMED: Device will reboot in %4lu seconds  ║", timeout_sec);
+    ESP_LOGW(TAG, "║  This ensures device returns to sleep/wake cycle          ║");
+    ESP_LOGW(TAG, "╚════════════════════════════════════════════════════════════╝");
+
+    // Main countdown loop - check every 10 seconds
+    while (elapsed_sec < timeout_sec) {
+        uint32_t remaining = timeout_sec - elapsed_sec;
+
+        // Log warnings in final 5 minutes
+        if (remaining <= 300 && remaining % 60 == 0) {
+            ESP_LOGW(TAG, "⏰ FAILSAFE: %lu minutes until automatic reboot", remaining / 60);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        elapsed_sec += 10;
+    }
+
+    // TIMEOUT REACHED - FORCE REBOOT
+    ESP_LOGW(TAG, "");
+    ESP_LOGW(TAG, "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGW(TAG, "║           FAILSAFE TRIGGERED - FORCING REBOOT              ║");
+    ESP_LOGW(TAG, "╚════════════════════════════════════════════════════════════╝");
+    ESP_LOGW(TAG, "Reason: Maximum uptime (%lu sec) reached", timeout_sec);
+
+    // Get final battery status
+    battery_status_t battery;
+    if (power_get_battery_status(&battery) == ESP_OK) {
+        ESP_LOGI(TAG, "Final battery: %.2fV (%.0f%%)", battery.voltage, battery.percentage);
+    }
+
+    // Prepare GPIO states
+    ESP_LOGI(TAG, "Preparing GPIO states for reboot...");
+    power_prepare_for_sleep();
+
+    // Stop web server if running
+    extern httpd_handle_t web_server;
+    if (web_server != NULL) {
+        ESP_LOGI(TAG, "Stopping web server...");
+        extern void stop_webserver(void);
+        stop_webserver();
+    }
+
+    // Stop WiFi
+    ESP_LOGI(TAG, "Stopping WiFi...");
+    esp_wifi_stop();
+
+    // Allow logs to flush
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    ESP_LOGW(TAG, "=== REBOOTING NOW ===");
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Force restart
+    esp_restart();
+}
+
+/**
+ * @brief Start the failsafe reboot timer
+ */
+static void start_failsafe_timer(void) {
+    #if !ENABLE_FAILSAFE_REBOOT
+    ESP_LOGI(TAG, "Failsafe timer disabled in config");
+    return;
+    #endif
+
+    if (failsafe_armed) {
+        ESP_LOGW(TAG, "Failsafe timer already armed - ignoring duplicate start");
+        return;
+    }
+
+    static uint32_t timeout = MAX_UPTIME_AFTER_WIFI_SEC;
+
+    BaseType_t result = xTaskCreate(
+        failsafe_reboot_task,
+        "failsafe",
+        4096,                           // Stack size
+        &timeout,                       // Pass timeout as parameter
+        configMAX_PRIORITIES - 1,       // HIGHEST priority
+        &failsafe_task_handle
+    );
+
+    if (result != pdPASS) {
+        ESP_LOGE(TAG, "CRITICAL: Failed to create failsafe task!");
+        return;
+    }
+
+    failsafe_armed = true;
+    failsafe_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+
+    ESP_LOGW(TAG, "");
+    ESP_LOGW(TAG, "⏰ FAILSAFE ENABLED: Device will auto-reboot in %lu seconds (%.1f hours)",
+            timeout, timeout / 3600.0f);
+    ESP_LOGW(TAG, "   This prevents battery drain from extended wake periods");
+    ESP_LOGW(TAG, "");
+}
+
+/**
+ * @brief Get failsafe status for web interface
+ */
+void get_failsafe_status(bool *is_armed, uint32_t *remaining_sec) {
+    if (!is_armed || !remaining_sec) return;
+
+    *is_armed = failsafe_armed;
+
+    if (failsafe_armed) {
+        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+        uint32_t elapsed = current_time - failsafe_start_time;
+
+        if (elapsed < MAX_UPTIME_AFTER_WIFI_SEC) {
+            *remaining_sec = MAX_UPTIME_AFTER_WIFI_SEC - elapsed;
+        } else {
+            *remaining_sec = 0;
+        }
+    } else {
+        *remaining_sec = 0;
+    }
+}
 
 // Main application entry
 void app_main(void) {
@@ -1171,6 +1317,16 @@ void app_main(void) {
 
     // Initialize system
     init_system();
+
+    // ========================================================================
+    // CRITICAL: Check 24-hour absolute timer immediately after init
+    // This MUST be called before any operations that could hang
+    // Will force reboot if accumulated uptime exceeds 24 hours
+    // This is the ultimate safety mechanism for bulletproof operation
+    // ========================================================================
+    ESP_LOGI(TAG, "Checking 24-hour absolute timer...");
+    power_check_absolute_timer();  // Will reboot if > 24 hours, otherwise continues
+    ESP_LOGI(TAG, "24-hour timer check complete");
 
     // Restore state if waking from deep sleep
     if (wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
@@ -1226,6 +1382,10 @@ void app_main(void) {
     // Update global IP
     device_ip = (char*)ip;
 
+    // Start failsafe timer to ensure device returns to sleep cycle
+    ESP_LOGI(TAG, "Starting failsafe timer...");
+    start_failsafe_timer();
+
     // Initialize SPIFFS storage
     ESP_LOGI(TAG, "Initializing storage...");
     init_storage();
@@ -1259,6 +1419,12 @@ void app_main(void) {
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));  // Check every second
+
+        // ====================================================================
+        // CRITICAL: Feed hardware watchdog to prevent reboot
+        // Must be called at least every 60 seconds
+        // ====================================================================
+        // power_feed_watchdog();
 
         // Log status every 10 seconds
         if ((xTaskGetTickCount() - last_status) > pdMS_TO_TICKS(10000)) {

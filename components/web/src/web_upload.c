@@ -1,5 +1,6 @@
 #include "web_upload.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "hex_parser.h"
 #include "swd_flash.h"
 #include "swd_mem.h"
@@ -473,25 +474,21 @@ static esp_err_t upload_post_handler(httpd_req_t *req) {
         int recv_len = httpd_req_recv(req, (char*)buf, MIN(remaining, sizeof(buf)));
 
         if (recv_len <= 0) {
-            if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
-                ESP_LOGW(TAG, "Socket timeout");
-                continue;
-            }
-            ESP_LOGE(TAG, "Receive failed");
+            ESP_LOGE(TAG, "Upload failed: %d - rebooting in 2 seconds", recv_len);
             fclose(f);
             unlink(filepath);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload failed");
-            return ESP_FAIL;
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            esp_restart();
         }
 
         // Write exact bytes received
         size_t written = fwrite(buf, 1, recv_len, f);
         if (written != (size_t)recv_len) {
-            ESP_LOGE(TAG, "File write failed");
+            ESP_LOGE(TAG, "Write failed - rebooting in 2 seconds");
             fclose(f);
             unlink(filepath);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Storage full");
-            return ESP_FAIL;
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            esp_restart();
         }
 
         received += recv_len;

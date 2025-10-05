@@ -22,6 +22,24 @@
 // #define WIFI_DISCONNECT_GRACE_SEC 5           // No longer used
 
 // =============================================================================
+// Failsafe Reboot Timer (CRITICAL FOR POWER MANAGEMENT)
+// =============================================================================
+
+// Maximum time device stays awake after successful WiFi connection
+// After this time, device WILL reboot and return to sleep/wake cycle
+// This ensures device cannot get "stuck" awake and drain battery
+
+#define ENABLE_FAILSAFE_REBOOT true             // Master enable for failsafe
+#define MAX_UPTIME_AFTER_WIFI_SEC 120           // 2 minutes for testing
+                                                 // Use 1800 (30 min) for production
+
+// Failsafe Operation:
+// 1. Timer starts when WiFi connects successfully
+// 2. Timer runs at HIGHEST priority - cannot be blocked
+// 3. At timeout, device logs warning and forces clean reboot
+// 4. After reboot, normal sleep/wake cycle resumes
+
+// =============================================================================
 // WiFi Resilience Settings
 // =============================================================================
 

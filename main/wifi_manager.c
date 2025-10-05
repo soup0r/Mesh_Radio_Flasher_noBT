@@ -282,10 +282,6 @@ bool wifi_manager_is_connected(void) {
     return current_state == WIFI_STATE_CONNECTED;
 }
 
-static wifi_state_t wifi_manager_get_state(void) {
-    return current_state;
-}
-
 const char* wifi_manager_get_ip(void) {
     return current_ip;
 }

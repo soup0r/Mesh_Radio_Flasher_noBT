@@ -13,6 +13,7 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "esp_task_wdt.h"
 
 static const char *TAG = "POWER_MGMT";
 static power_config_t power_config = {0};
@@ -31,6 +32,12 @@ RTC_DATA_ATTR static uint64_t rtc_nrf_off_total_ms = 0;
 RTC_DATA_ATTR static uint64_t rtc_last_sleep_us = 0;
 RTC_DATA_ATTR static bool rtc_nrf_power_off_active = false;
 
+// 24-hour absolute timer - survives deep sleep and tracks total uptime
+RTC_DATA_ATTR static uint64_t rtc_first_boot_timestamp = 0;
+RTC_DATA_ATTR static uint64_t rtc_total_uptime_sec = 0;
+RTC_DATA_ATTR static uint64_t rtc_last_wake_timestamp = 0;
+RTC_DATA_ATTR static bool rtc_timer_initialized = false;
+
 // Regular variables for WiFi/sleep management
 static uint32_t wake_count = 0;
 
@@ -45,6 +52,13 @@ static char wifi_current_ssid[33] = {0};  // Max SSID length is 32 + null termin
 #define BATTERY_CRITICAL_VOLTAGE 3.2f
 #define BATTERY_LOW_VOLTAGE 3.5f
 #define ADC_SAMPLES_COUNT 10
+
+// 24-hour absolute reboot interval (can be changed for testing)
+#define ABSOLUTE_REBOOT_INTERVAL_SEC (24 * 60 * 60)  // 24 hours in seconds
+// #define ABSOLUTE_REBOOT_INTERVAL_SEC 300  // 5 minutes for testing
+
+// Hardware watchdog timeout (must be fed regularly or device reboots)
+#define HARDWARE_WATCHDOG_TIMEOUT_SEC 60  // 60 seconds
 
 esp_err_t power_battery_init(void) {
     ESP_LOGI(TAG, "Initializing battery monitoring on GPIO2");
@@ -389,6 +403,174 @@ uint64_t calculate_sleep_duration_us(float battery_voltage) {
     }
 
     return sleep_seconds * 1000000ULL;
+}
+
+// =============================================================================
+// 24-HOUR ABSOLUTE TIMER IMPLEMENTATION
+// =============================================================================
+
+/**
+ * @brief Check and enforce 24-hour absolute reboot timer
+ *
+ * This function MUST be called at every boot/wake before any other operations.
+ * It tracks total uptime across sleep/wake cycles using RTC memory.
+ * After 24 hours of accumulated uptime, it forces a reboot.
+ *
+ * This is the ultimate safety mechanism - ensures device reboots every 24 hours
+ * regardless of WiFi status, sleep cycles, or any other conditions.
+ *
+ * @return ESP_OK if within time limit, never returns if time exceeded (reboots)
+ */
+esp_err_t power_check_absolute_timer(void) {
+    uint64_t current_time = esp_timer_get_time() / 1000000ULL;  // Uptime in seconds
+
+    // First boot ever (or RTC memory was lost/corrupted)
+    if (!rtc_timer_initialized) {
+        ESP_LOGW(TAG, "╔════════════════════════════════════════════════════════════╗");
+        ESP_LOGW(TAG, "║        24-HOUR ABSOLUTE TIMER INITIALIZED                  ║");
+        ESP_LOGW(TAG, "║   Device will force reboot after 24 hours total uptime    ║");
+        ESP_LOGW(TAG, "╚════════════════════════════════════════════════════════════╝");
+
+        rtc_first_boot_timestamp = current_time;
+        rtc_total_uptime_sec = 0;
+        rtc_last_wake_timestamp = current_time;
+        rtc_timer_initialized = true;
+
+        ESP_LOGI(TAG, "Absolute timer: Starting new 24-hour cycle");
+        return ESP_OK;
+    }
+
+    // Subsequent boot/wake - accumulate uptime
+    // This handles cases where device sleeps and wakes multiple times
+    uint64_t session_duration = current_time - rtc_last_wake_timestamp;
+    rtc_total_uptime_sec += session_duration;
+    rtc_last_wake_timestamp = current_time;
+
+    uint64_t remaining_sec = ABSOLUTE_REBOOT_INTERVAL_SEC - rtc_total_uptime_sec;
+    uint64_t remaining_hours = remaining_sec / 3600;
+
+    ESP_LOGI(TAG, "Absolute timer: Total uptime %llu/%llu sec (%llu hours remaining)",
+            rtc_total_uptime_sec, (uint64_t)ABSOLUTE_REBOOT_INTERVAL_SEC, remaining_hours);
+
+    // Check if 24 hours exceeded - FORCE REBOOT
+    if (rtc_total_uptime_sec >= ABSOLUTE_REBOOT_INTERVAL_SEC) {
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "╔════════════════════════════════════════════════════════════╗");
+        ESP_LOGW(TAG, "║     24-HOUR ABSOLUTE TIMER EXPIRED - FORCING REBOOT        ║");
+        ESP_LOGW(TAG, "╚════════════════════════════════════════════════════════════╝");
+        ESP_LOGW(TAG, "Total uptime: %llu seconds (%.1f hours)",
+                rtc_total_uptime_sec, rtc_total_uptime_sec / 3600.0);
+        ESP_LOGW(TAG, "This is a safety mechanism - device will reboot now");
+
+        // Get final battery status before reboot
+        battery_status_t battery;
+        if (power_get_battery_status(&battery) == ESP_OK) {
+            ESP_LOGI(TAG, "Final battery: %.2fV (%.0f%%)", battery.voltage, battery.percentage);
+        }
+
+        // Reset timer for next cycle
+        rtc_timer_initialized = false;
+        rtc_total_uptime_sec = 0;
+
+        // Prepare GPIO states for reboot
+        power_prepare_for_sleep();
+        vTaskDelay(pdMS_TO_TICKS(1000));  // Allow logs to flush
+
+        ESP_LOGW(TAG, "=== 24-HOUR ABSOLUTE REBOOT NOW ===");
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        // Force restart - execution never returns from here
+        esp_restart();
+    }
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Get status of 24-hour absolute timer for monitoring/web interface
+ *
+ * @param[out] uptime_sec Total accumulated uptime in seconds
+ * @param[out] remaining_sec Seconds remaining until forced reboot
+ */
+void power_get_absolute_timer_status(uint64_t *uptime_sec, uint64_t *remaining_sec) {
+    if (uptime_sec) {
+        *uptime_sec = rtc_total_uptime_sec;
+    }
+
+    if (remaining_sec) {
+        if (rtc_total_uptime_sec < ABSOLUTE_REBOOT_INTERVAL_SEC) {
+            *remaining_sec = ABSOLUTE_REBOOT_INTERVAL_SEC - rtc_total_uptime_sec;
+        } else {
+            *remaining_sec = 0;
+        }
+    }
+}
+
+/**
+ * @brief Reset the 24-hour timer (for testing or maintenance mode)
+ *
+ * WARNING: Use only for testing. In production, let timer run normally.
+ */
+void power_reset_absolute_timer(void) {
+    ESP_LOGW(TAG, "Manually resetting 24-hour absolute timer");
+    rtc_timer_initialized = false;
+    rtc_total_uptime_sec = 0;
+    rtc_first_boot_timestamp = 0;
+    rtc_last_wake_timestamp = 0;
+}
+
+// =============================================================================
+// HARDWARE WATCHDOG IMPLEMENTATION
+// =============================================================================
+
+/**
+ * @brief Initialize hardware watchdog timer
+ *
+ * The hardware watchdog must be fed every 60 seconds or the device will reboot.
+ * This catches complete hangs where the entire system becomes unresponsive.
+ *
+ * @return ESP_OK on success, error code otherwise
+ */
+esp_err_t power_init_hardware_watchdog(void) {
+    ESP_LOGI(TAG, "Initializing hardware watchdog (%d second timeout)",
+            HARDWARE_WATCHDOG_TIMEOUT_SEC);
+
+    // Configure watchdog
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = HARDWARE_WATCHDOG_TIMEOUT_SEC * 1000,
+        .idle_core_mask = 0,        // Don't watch idle task
+        .trigger_panic = false      // Just reboot, don't panic
+    };
+
+    esp_err_t ret = esp_task_wdt_init(&wdt_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to init hardware watchdog: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Subscribe current task (main task)
+    ret = esp_task_wdt_add(NULL);  // NULL = current task
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add task to watchdog: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGW(TAG, "⚠️  Hardware watchdog active - must feed every %d seconds or device reboots",
+            HARDWARE_WATCHDOG_TIMEOUT_SEC);
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Feed the hardware watchdog
+ *
+ * This function MUST be called regularly (at least every 60 seconds)
+ * to prevent the hardware watchdog from triggering a reboot.
+ *
+ * Call this in your main monitoring loop.
+ */
+void power_feed_watchdog(void) {
+    esp_task_wdt_reset();
 }
 
 // Enhanced deep sleep function for ESP32-C3 with proper timing
