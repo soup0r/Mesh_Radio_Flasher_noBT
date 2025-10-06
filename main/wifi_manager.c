@@ -116,15 +116,8 @@ static esp_err_t try_wifi_mode(const char* ssid, const char* password, bool is_l
     ESP_LOGI(TAG, "WiFi started");
 
     // === NOW SET THE RESILIENCE PARAMETERS AFTER WIFI IS STARTED ===
-    // Set inactive time (how long before AP considers us disconnected)
-    esp_err_t err = esp_wifi_set_inactive_time(WIFI_IF_STA, 30);  // 30 seconds
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Set WiFi inactive time to 30 seconds");
-    } else {
-        ESP_LOGW(TAG, "Failed to set inactive time: %s", esp_err_to_name(err));
-    }
-
     // Set maximum TX power for better range (normal mode only)
+    esp_err_t err;
     if (!is_lr) {
         err = esp_wifi_set_max_tx_power(84);  // 84 = 21dBm (max for ESP32-C3)
         if (err == ESP_OK) {
@@ -259,21 +252,42 @@ void wifi_manager_disconnect_handler(void) {
 
     handling_disconnect = true;
 
-    ESP_LOGW(TAG, "WiFi disconnected - cleaning up and entering deep sleep");
+    ESP_LOGW(TAG, "");
+    ESP_LOGW(TAG, "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGW(TAG, "║  WIFI DISCONNECTED - RETURNING TO SLEEP/WAKE CYCLE         ║");
+    ESP_LOGW(TAG, "╚════════════════════════════════════════════════════════════╝");
+    ESP_LOGW(TAG, "");
 
     // Stop the web server before WiFi shutdown
-    extern void stop_webserver(void);  // Forward declaration
+    extern void stop_webserver(void);
     stop_webserver();
     ESP_LOGI(TAG, "Web server stopped");
 
     // Stop WiFi cleanly
     esp_wifi_stop();
+    ESP_LOGI(TAG, "WiFi stopped");
 
     // Give a short delay for cleanup
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    // Enter deep sleep immediately
-    ESP_LOGI(TAG, "Entering deep sleep after disconnect");
+    // Check battery one more time before sleep
+    battery_status_t battery;
+    power_get_battery_status(&battery);
+    ESP_LOGI(TAG, "Pre-sleep battery check: %.2fV (%.0f%%)",
+             battery.voltage, battery.percentage);
+
+    // Determine appropriate sleep message
+    if (battery.voltage < BATTERY_CRITICAL_THRESHOLD) {
+        ESP_LOGI(TAG, "Critical battery - entering extended sleep");
+    } else if (battery.voltage < BATTERY_LOW_THRESHOLD) {
+        ESP_LOGI(TAG, "Low battery - entering longer sleep interval");
+    } else {
+        ESP_LOGI(TAG, "Normal battery - entering standard sleep interval");
+    }
+
+    // Enter deep sleep
+    ESP_LOGI(TAG, "Entering adaptive deep sleep after disconnect");
+    ESP_LOGI(TAG, "");
     power_enter_adaptive_deep_sleep();
     // Never returns
 }

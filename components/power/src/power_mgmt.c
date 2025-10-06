@@ -53,10 +53,6 @@ static char wifi_current_ssid[33] = {0};  // Max SSID length is 32 + null termin
 #define BATTERY_LOW_VOLTAGE 3.5f
 #define ADC_SAMPLES_COUNT 10
 
-// 24-hour absolute reboot interval (can be changed for testing)
-#define ABSOLUTE_REBOOT_INTERVAL_SEC (24 * 60 * 60)  // 24 hours in seconds
-// #define ABSOLUTE_REBOOT_INTERVAL_SEC 300  // 5 minutes for testing
-
 // Hardware watchdog timeout (must be fed regularly or device reboots)
 #define HARDWARE_WATCHDOG_TIMEOUT_SEC 60  // 60 seconds
 
@@ -422,13 +418,20 @@ uint64_t calculate_sleep_duration_us(float battery_voltage) {
  * @return ESP_OK if within time limit, never returns if time exceeded (reboots)
  */
 esp_err_t power_check_absolute_timer(void) {
+    // Check if timer is enabled in config
+    if (!power_config.enable_absolute_timer) {
+        ESP_LOGI(TAG, "24-hour absolute timer disabled in config");
+        return ESP_OK;
+    }
+
     uint64_t current_time = esp_timer_get_time() / 1000000ULL;  // Uptime in seconds
 
     // First boot ever (or RTC memory was lost/corrupted)
     if (!rtc_timer_initialized) {
         ESP_LOGW(TAG, "╔════════════════════════════════════════════════════════════╗");
         ESP_LOGW(TAG, "║        24-HOUR ABSOLUTE TIMER INITIALIZED                  ║");
-        ESP_LOGW(TAG, "║   Device will force reboot after 24 hours total uptime    ║");
+        ESP_LOGW(TAG, "║   Device will force reboot after %lu hours total uptime   ║",
+                power_config.absolute_reboot_interval_sec / 3600);
         ESP_LOGW(TAG, "╚════════════════════════════════════════════════════════════╝");
 
         rtc_first_boot_timestamp = current_time;
@@ -436,7 +439,8 @@ esp_err_t power_check_absolute_timer(void) {
         rtc_last_wake_timestamp = current_time;
         rtc_timer_initialized = true;
 
-        ESP_LOGI(TAG, "Absolute timer: Starting new 24-hour cycle");
+        ESP_LOGI(TAG, "Absolute timer: Starting new %lu-hour cycle",
+                power_config.absolute_reboot_interval_sec / 3600);
         return ESP_OK;
     }
 
@@ -446,20 +450,25 @@ esp_err_t power_check_absolute_timer(void) {
     rtc_total_uptime_sec += session_duration;
     rtc_last_wake_timestamp = current_time;
 
-    uint64_t remaining_sec = ABSOLUTE_REBOOT_INTERVAL_SEC - rtc_total_uptime_sec;
+    uint64_t remaining_sec = power_config.absolute_reboot_interval_sec - rtc_total_uptime_sec;
     uint64_t remaining_hours = remaining_sec / 3600;
 
-    ESP_LOGI(TAG, "Absolute timer: Total uptime %llu/%llu sec (%llu hours remaining)",
-            rtc_total_uptime_sec, (uint64_t)ABSOLUTE_REBOOT_INTERVAL_SEC, remaining_hours);
+    ESP_LOGI(TAG, "Absolute timer: Total uptime %llu/%lu sec (%llu hours remaining)",
+            rtc_total_uptime_sec,
+            power_config.absolute_reboot_interval_sec,
+            remaining_hours);
 
-    // Check if 24 hours exceeded - FORCE REBOOT
-    if (rtc_total_uptime_sec >= ABSOLUTE_REBOOT_INTERVAL_SEC) {
+    // Check if timer expired - FORCE REBOOT
+    if (rtc_total_uptime_sec >= power_config.absolute_reboot_interval_sec) {
         ESP_LOGW(TAG, "");
         ESP_LOGW(TAG, "╔════════════════════════════════════════════════════════════╗");
         ESP_LOGW(TAG, "║     24-HOUR ABSOLUTE TIMER EXPIRED - FORCING REBOOT        ║");
         ESP_LOGW(TAG, "╚════════════════════════════════════════════════════════════╝");
         ESP_LOGW(TAG, "Total uptime: %llu seconds (%.1f hours)",
                 rtc_total_uptime_sec, rtc_total_uptime_sec / 3600.0);
+        ESP_LOGW(TAG, "Configured limit: %lu seconds (%.1f hours)",
+                power_config.absolute_reboot_interval_sec,
+                power_config.absolute_reboot_interval_sec / 3600.0);
         ESP_LOGW(TAG, "This is a safety mechanism - device will reboot now");
 
         // Get final battery status before reboot
@@ -476,7 +485,7 @@ esp_err_t power_check_absolute_timer(void) {
         power_prepare_for_sleep();
         vTaskDelay(pdMS_TO_TICKS(1000));  // Allow logs to flush
 
-        ESP_LOGW(TAG, "=== 24-HOUR ABSOLUTE REBOOT NOW ===");
+        ESP_LOGW(TAG, "=== ABSOLUTE TIMER REBOOT NOW ===");
         vTaskDelay(pdMS_TO_TICKS(100));
 
         // Force restart - execution never returns from here
@@ -498,8 +507,8 @@ void power_get_absolute_timer_status(uint64_t *uptime_sec, uint64_t *remaining_s
     }
 
     if (remaining_sec) {
-        if (rtc_total_uptime_sec < ABSOLUTE_REBOOT_INTERVAL_SEC) {
-            *remaining_sec = ABSOLUTE_REBOOT_INTERVAL_SEC - rtc_total_uptime_sec;
+        if (rtc_total_uptime_sec < power_config.absolute_reboot_interval_sec) {
+            *remaining_sec = power_config.absolute_reboot_interval_sec - rtc_total_uptime_sec;
         } else {
             *remaining_sec = 0;
         }
@@ -736,40 +745,108 @@ esp_err_t power_restore_from_deep_sleep(void) {
     battery_status_t battery;
     power_get_battery_status(&battery);
 
-    ESP_LOGI(TAG, "Current battery: %.2fV (%.0f%%)",
-            battery.voltage, battery.percentage);
+    ESP_LOGI(TAG, "Current battery: %.2fV, NRF52 state: %s, Protection active: %s",
+            battery.voltage,
+            power_state ? "ON" : "OFF",
+            rtc_nrf_power_off_active ? "YES" : "NO");
 
-    // Hysteresis for power management
-    const float POWER_ON_HYSTERESIS = 0.2f;
+    // =========================================================================
+    // NRF52 Power Management Logic
+    // All thresholds configured in config.h
+    // =========================================================================
 
-    if (battery.voltage < NRF52_POWER_OFF_VOLTAGE && power_state) {
-        // Battery still too low - keep nRF52 off
-        ESP_LOGW(TAG, "Battery still low (%.2fV) - keeping nRF52 OFF",
-                battery.voltage);
-        power_target_off();
-        rtc_nrf_power_state = false;
+    // CASE 1: Battery is LOW - turn OFF or keep OFF
+    if (battery.voltage < NRF52_POWER_OFF_VOLTAGE && ENABLE_BATTERY_PROTECTION) {
 
-        if (!rtc_nrf_power_off_active) {
-            rtc_nrf_power_off_active = true;
-            rtc_nrf_off_total_ms = 0;
+        if (power_state) {
+            // Currently ON but battery is low - turn OFF
+            ESP_LOGW(TAG, "Battery low (%.2fV < %.2fV) - turning nRF52 OFF",
+                    battery.voltage, NRF52_POWER_OFF_VOLTAGE);
+            power_target_off();
+            rtc_nrf_power_state = false;
+
+            // Start power-off protection period
+            if (!rtc_nrf_power_off_active) {
+                rtc_nrf_power_off_active = true;
+                rtc_nrf_off_total_ms = 0;
+                ESP_LOGI(TAG, "Starting nRF52 power-off protection period");
+            }
+        } else {
+            // Already OFF - keep it off
+            ESP_LOGI(TAG, "Battery still low (%.2fV) - keeping nRF52 OFF (off for %llu ms)",
+                    battery.voltage, rtc_nrf_off_total_ms);
         }
+    }
 
-    } else if (battery.voltage > (NRF52_POWER_OFF_VOLTAGE + POWER_ON_HYSTERESIS) &&
-               !power_state && rtc_nrf_power_off_active) {
-        // Battery has recovered - check if enough time has passed
-        uint32_t required_off_ms = NRF52_POWER_OFF_SEC * 1000ULL;
+    // CASE 2: Battery has RECOVERED - decide whether to turn ON
+    else if (rtc_nrf_power_off_active && !power_state) {
+        // We're in protection mode and NRF52 is OFF
 
-        if (rtc_nrf_off_total_ms >= required_off_ms) {
-            ESP_LOGI(TAG, "Battery recovered (%.2fV) and timeout elapsed (%llu/%lu ms) - turning nRF52 ON",
-                    battery.voltage, rtc_nrf_off_total_ms, required_off_ms);
+        float turn_on_threshold = NRF52_POWER_OFF_VOLTAGE + NRF52_POWER_ON_HYSTERESIS;
+        uint32_t min_off_time_ms = NRF52_MIN_OFF_TIME_SEC * 1000UL;
+        uint32_t max_off_time_ms = NRF52_MAX_OFF_TIME_SEC * 1000UL;
+
+        bool voltage_good = (battery.voltage >= turn_on_threshold);
+        bool min_time_elapsed = (rtc_nrf_off_total_ms >= min_off_time_ms);
+        bool max_time_exceeded = (rtc_nrf_off_total_ms >= max_off_time_ms);
+
+        ESP_LOGI(TAG, "NRF52 Recovery Check:");
+        ESP_LOGI(TAG, "  Battery: %.2fV (need %.2fV) %s",
+                battery.voltage, turn_on_threshold, voltage_good ? "✓" : "✗");
+        ESP_LOGI(TAG, "  Min time: %llu/%lu ms %s",
+                rtc_nrf_off_total_ms, min_off_time_ms, min_time_elapsed ? "✓" : "✗");
+        ESP_LOGI(TAG, "  Max time: %llu/%lu ms %s",
+                rtc_nrf_off_total_ms, max_off_time_ms, max_time_exceeded ? "(exceeded)" : "");
+
+        // Turn ON if:
+        // (Battery is good AND minimum time elapsed) OR maximum time exceeded
+        if ((voltage_good && min_time_elapsed) || max_time_exceeded) {
+
+            if (max_time_exceeded && !voltage_good) {
+                ESP_LOGW(TAG, "Maximum off time (%lu sec) exceeded - attempting turn-on despite marginal voltage",
+                        NRF52_MAX_OFF_TIME_SEC);
+            }
+
+            ESP_LOGI(TAG, "✓ Conditions met - turning nRF52 ON");
             power_target_on();
             rtc_nrf_power_state = true;
+
+            // Exit protection mode
             rtc_nrf_power_off_active = false;
-            rtc_nrf_off_total_ms = 0;  // Reset the timer
+            rtc_nrf_off_total_ms = 0;
+
+            ESP_LOGI(TAG, "nRF52 power protection period ended");
+
         } else {
-            ESP_LOGI(TAG, "Battery recovered (%.2fV) but waiting for timeout (%llu/%lu ms)",
-                    battery.voltage, rtc_nrf_off_total_ms, required_off_ms);
+            // Not ready to turn on yet
+            ESP_LOGI(TAG, "Keeping nRF52 OFF - conditions not met");
+
+            if (!voltage_good) {
+                ESP_LOGI(TAG, "  Waiting for battery: %.2fV → %.2fV (need +%.2fV)",
+                        battery.voltage, turn_on_threshold,
+                        turn_on_threshold - battery.voltage);
+            }
+            if (!min_time_elapsed) {
+                uint32_t remaining_ms = min_off_time_ms - rtc_nrf_off_total_ms;
+                ESP_LOGI(TAG, "  Waiting for minimum time: %lu seconds remaining",
+                        remaining_ms / 1000);
+            }
         }
+    }
+
+    // CASE 3: Battery is GOOD and not in protection mode
+    else if (battery.voltage >= NRF52_POWER_OFF_VOLTAGE && !power_state) {
+        // Battery is good but NRF52 is off (not in protection mode)
+        // This can happen after a manual power off or other edge cases
+        ESP_LOGI(TAG, "Battery good (%.2fV) and NRF52 is OFF - turning ON",
+                battery.voltage);
+        power_target_on();
+        rtc_nrf_power_state = true;
+    }
+
+    // CASE 4: Everything is normal
+    else if (power_state) {
+        ESP_LOGI(TAG, "NRF52 ON, battery sufficient (%.2fV)", battery.voltage);
     }
 
     ESP_LOGI(TAG, "=== Wake Restoration Complete ===");

@@ -45,6 +45,28 @@ static TaskHandle_t failsafe_task_handle = NULL;
 static bool failsafe_armed = false;
 static uint32_t failsafe_start_time = 0;
 
+// Brownout loop protection (RTC memory - persists through resets and deep sleep)
+RTC_DATA_ATTR static uint32_t rtc_brownout_count = 0;
+RTC_DATA_ATTR static uint64_t rtc_last_brownout_time = 0;
+
+// Wake state machine types
+typedef enum {
+    WAKE_STATE_INIT,
+    WAKE_STATE_BATTERY_CHECK,
+    WAKE_STATE_NRF52_DECISION,
+    WAKE_STATE_WIFI_SCAN,
+    WAKE_STATE_ACTIVE,
+    WAKE_STATE_SLEEP
+} wake_state_t;
+
+typedef struct {
+    wake_state_t state;
+    battery_status_t battery;
+    bool nrf52_should_be_on;
+    bool wifi_connected;
+    uint32_t wake_count;
+} wake_context_t;
+
 // Function declarations
 static void init_system(void);
 static void init_storage(void);
@@ -255,12 +277,7 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "</div>"
         "<div class='info-card'>"
         "<h3>Firmware Upload</h3>"
-        "<select id='fwType' style='padding:8px;border:1px solid #ddd;border-radius:4px;width:250px;margin-right:10px;'>"
-        "<option value='app'>Application (0x26000)</option>"
-        "<option value='softdevice'>SoftDevice (0x1000)</option>"
-        "<option value='bootloader'>Bootloader (0xF4000)</option>"
-        "<option value='full'>Full Image (from hex)</option>"
-        "</select><br><br>"
+        "<p style='color:#6c757d;margin-bottom:15px;'>Select a .hex file to upload and flash. The hex file contains all address information.</p>"
         "<input type='file' id='hexFile' accept='.hex' style='margin-bottom:10px;'/><br>"
         "<button id='uploadBtn' class='btn' onclick='uploadFirmware()'>Upload & Flash</button>"
         "<div style='margin-top:20px;'>"
@@ -1134,16 +1151,17 @@ static void init_system(void) {
         .wake_ssid = WIFI_SSID,
         .watchdog_timeout_sec = 0,
         .enable_brownout_detect = true,
-        // .max_retry_count removed - no longer used
-        .error_cooldown_ms = 1000
+        .error_cooldown_ms = 1000,
+        .absolute_reboot_interval_sec = ABSOLUTE_REBOOT_INTERVAL_SEC,
+        .enable_absolute_timer = ENABLE_ABSOLUTE_REBOOT_TIMER
     };
     ESP_ERROR_CHECK(power_mgmt_init(&power_cfg));
 
     wake_reason_t wake_reason = power_get_wake_reason();
     ESP_LOGI(TAG, "Wake reason: %d", wake_reason);
 
-    ESP_LOGI(TAG, "Initializing SWD connection...");
-    try_swd_connection();
+    // SWD initialization removed - only initializes when web interface requests it
+    ESP_LOGI(TAG, "SWD will initialize on-demand when needed");
 
     xTaskCreate(system_health_task, "health", 4096, NULL, 5, NULL);
 
@@ -1302,15 +1320,140 @@ void get_failsafe_status(bool *is_armed, uint32_t *remaining_sec) {
 
 // Main application entry
 void app_main(void) {
+    // =========================================================================
+    // BROWNOUT LOOP PROTECTION - Hardware BMS System
+    // =========================================================================
+    // Note: ESP32 bootloader brownout detector is DISABLED in sdkconfig
+    //
+    // Protection Strategy:
+    // 1. Application checks battery voltage (3.4V-3.6V thresholds)
+    // 2. Hardware BMS cuts power at ~3.0V (external protection)
+    // 3. ESP32 brownout (2.4V) is disabled - never reached due to BMS
+    //
+    // The code below handles bootloader brownout IF it were enabled,
+    // but with BMS protection this should never trigger.
+    // Keeping the code for systems without BMS or for diagnostics.
+    // =========================================================================
+
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    uint64_t current_time_sec = esp_timer_get_time() / 1000000ULL;
+
+    if (reset_reason == ESP_RST_BROWNOUT) {
+        // Brownout should not happen with BMS, but handle it anyway
+        rtc_brownout_count++;
+        rtc_last_brownout_time = current_time_sec;
+
+        // Use printf instead of ESP_LOG (not initialized yet)
+        printf("\n");
+        printf("╔════════════════════════════════════════════════════════════╗\n");
+        printf("║  ⚠️  UNEXPECTED BROWNOUT RESET (#%lu)                     ║\n",
+               (unsigned long)rtc_brownout_count);
+        printf("║  This should not occur with BMS protection!               ║\n");
+        printf("║  Check BMS configuration and wiring.                      ║\n");
+        printf("╚════════════════════════════════════════════════════════════╝\n");
+        printf("\n");
+
+        // Still handle brownout loop for safety
+        if (rtc_brownout_count >= BROWNOUT_LOOP_THRESHOLD) {
+            printf("\n");
+            printf("╔════════════════════════════════════════════════════════════╗\n");
+            printf("║  🚨 BROWNOUT LOOP - EMERGENCY SLEEP                       ║\n");
+            printf("║  BMS may be malfunctioning - investigate immediately!     ║\n");
+            printf("╚════════════════════════════════════════════════════════════╝\n");
+            printf("║                                                            ║\n");
+            printf("║  Multiple brownout resets detected (%lu times)            ║\n",
+                   (unsigned long)rtc_brownout_count);
+            printf("║  ESP32 brownout detector should be DISABLED with BMS!     ║\n");
+            printf("║                                                            ║\n");
+            printf("║  ENTERING 24-HOUR RECOVERY SLEEP                          ║\n");
+            printf("║  Sleep duration: %lu hours                                ║\n",
+                   (unsigned long)(BROWNOUT_RECOVERY_SLEEP_SEC / 3600));
+            printf("╚════════════════════════════════════════════════════════════╝\n");
+            printf("\n");
+
+            // Minimal GPIO setup to turn off nRF52 (save maximum power)
+            // Do this with minimal initialization to avoid brownout
+            printf("Turning off nRF52 radio for maximum power savings...\n");
+            gpio_reset_pin(GPIO_NUM_10);  // TARGET_POWER_GPIO
+            gpio_set_direction(GPIO_NUM_10, GPIO_MODE_OUTPUT);
+            gpio_set_level(GPIO_NUM_10, 1);  // 1 = OFF
+
+            // Hold GPIO state during deep sleep
+            gpio_hold_en(GPIO_NUM_10);
+            gpio_deep_sleep_hold_en();
+
+            printf("nRF52 powered off.\n");
+            printf("\n");
+
+            // Configure wake timer for 24 hours
+            uint64_t sleep_time_us = (uint64_t)BROWNOUT_RECOVERY_SLEEP_SEC * 1000000ULL;
+            esp_sleep_enable_timer_wakeup(sleep_time_us);
+
+            printf("Entering deep sleep NOW...\n");
+            printf("════════════════════════════════════════════════════════════\n");
+            printf("\n");
+
+            // Small delay to allow UART to flush
+            for (volatile int i = 0; i < 1000000; i++) {
+                __asm__ __volatile__("nop");
+            }
+
+            // Enter deep sleep - execution never returns
+            esp_deep_sleep_start();
+            // NEVER RETURNS
+        }
+
+        // First or second brownout - allow retry but log it
+        printf("Brownout count: %lu (threshold: %d)\n",
+               (unsigned long)rtc_brownout_count, BROWNOUT_LOOP_THRESHOLD);
+        printf("Will enter recovery sleep if %d consecutive brownouts occur.\n",
+               BROWNOUT_LOOP_THRESHOLD);
+        printf("Attempting to continue boot...\n\n");
+
+    } else {
+        // Not a brownout reset - check if we recovered from previous brownouts
+        if (rtc_brownout_count > 0) {
+            // If last brownout was more than BROWNOUT_RESET_WINDOW_SEC ago, reset counter
+            if (current_time_sec > rtc_last_brownout_time &&
+                (current_time_sec - rtc_last_brownout_time) > BROWNOUT_RESET_WINDOW_SEC) {
+                printf("\n");
+                printf("✓ Brownout recovery successful!\n");
+                printf("  Previous brownout count: %lu\n", (unsigned long)rtc_brownout_count);
+                printf("  Time since last brownout: %llu seconds\n",
+                       (unsigned long long)(current_time_sec - rtc_last_brownout_time));
+                printf("  Resetting brownout counter.\n");
+                printf("\n");
+                rtc_brownout_count = 0;
+            } else {
+                printf("⚠️  Previous brownout count: %lu (monitoring for loop)\n",
+                       (unsigned long)rtc_brownout_count);
+            }
+        }
+    }
+
+    // =========================================================================
+    // Normal startup begins here
+    // =========================================================================
+
     ESP_LOGI(TAG, "=================================");
     ESP_LOGI(TAG, "Mesh Radio Flasher v%s", DEVICE_VERSION);
     ESP_LOGI(TAG, "Build: %s %s", __DATE__, __TIME__);
     ESP_LOGI(TAG, "=================================");
 
-    // Check and log wake reason
+    // =========================================================================
+    // STATE: INIT
+    // =========================================================================
+    wake_context_t wake_ctx = {
+        .state = WAKE_STATE_INIT,
+        .wifi_connected = false,
+        .nrf52_should_be_on = true,
+        .wake_count = 0
+    };
+
     esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
     if (wake_cause == ESP_SLEEP_WAKEUP_TIMER) {
-        ESP_LOGI(TAG, "=== Woke from deep sleep (count: %lu) ===", power_get_wake_count());
+        ESP_LOGI(TAG, "=== Woke from deep sleep (count: %lu) ===",
+                 power_get_wake_count());
     } else {
         ESP_LOGI(TAG, "=== Fresh boot (power on) ===");
     }
@@ -1321,11 +1464,11 @@ void app_main(void) {
     // ========================================================================
     // CRITICAL: Check 24-hour absolute timer immediately after init
     // This MUST be called before any operations that could hang
-    // Will force reboot if accumulated uptime exceeds 24 hours
+    // Will force reboot if accumulated uptime exceeds configured interval
     // This is the ultimate safety mechanism for bulletproof operation
     // ========================================================================
     ESP_LOGI(TAG, "Checking 24-hour absolute timer...");
-    power_check_absolute_timer();  // Will reboot if > 24 hours, otherwise continues
+    power_check_absolute_timer();  // Will reboot if exceeded, otherwise continues
     ESP_LOGI(TAG, "24-hour timer check complete");
 
     // Restore state if waking from deep sleep
@@ -1334,55 +1477,155 @@ void app_main(void) {
         power_restore_from_deep_sleep();
     }
 
-    // Check battery status
-    battery_status_t battery;
-    power_get_battery_status(&battery);
-    ESP_LOGI(TAG, "Battery: %.2fV (%.0f%%) - %s",
-            battery.voltage, battery.percentage,
-            battery.is_critical ? "CRITICAL" :
-            battery.is_low ? "LOW" :
-            battery.voltage > BATTERY_HIGH_THRESHOLD ? "HIGH" : "NORMAL");
+    wake_ctx.wake_count = power_get_wake_count();
 
-    // Critical battery protection
-    if (battery.voltage < BATTERY_CRITICAL_THRESHOLD && ENABLE_BATTERY_PROTECTION) {
-        ESP_LOGW(TAG, "!!! Critical battery (%.2fV) - entering extended deep sleep (%d sec) !!!",
-                battery.voltage, DEEP_SLEEP_CRITICAL_SEC);
-        power_target_off();  // Turn off nRF52 to save power
+    // =========================================================================
+    // STATE: BATTERY CHECK (ONCE)
+    // =========================================================================
+    wake_ctx.state = WAKE_STATE_BATTERY_CHECK;
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║  STATE: BATTERY CHECK                                      ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
+
+    power_get_battery_status(&wake_ctx.battery);
+    ESP_LOGI(TAG, "Battery: %.2fV (%.0f%%) - %s",
+            wake_ctx.battery.voltage,
+            wake_ctx.battery.percentage,
+            wake_ctx.battery.is_critical ? "CRITICAL" :
+            wake_ctx.battery.is_low ? "LOW" :
+            wake_ctx.battery.voltage > BATTERY_HIGH_THRESHOLD ? "HIGH" : "NORMAL");
+
+    // CRITICAL BATTERY - Skip everything, sleep immediately
+    if (wake_ctx.battery.voltage < BATTERY_CRITICAL_THRESHOLD &&
+        ENABLE_BATTERY_PROTECTION) {
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "╔════════════════════════════════════════════════════════════╗");
+        ESP_LOGW(TAG, "║  CRITICAL BATTERY - IMMEDIATE SLEEP                        ║");
+        ESP_LOGW(TAG, "║  Voltage: %.2fV (threshold: %.2fV)                        ║",
+                wake_ctx.battery.voltage, BATTERY_CRITICAL_THRESHOLD);
+        ESP_LOGW(TAG, "║  Skipping WiFi scan to conserve power                      ║");
+        ESP_LOGW(TAG, "║  Sleep duration: %d seconds (%.1f hours)                   ║",
+                DEEP_SLEEP_CRITICAL_SEC, DEEP_SLEEP_CRITICAL_SEC / 3600.0f);
+        ESP_LOGW(TAG, "╚════════════════════════════════════════════════════════════╝");
+        ESP_LOGW(TAG, "");
+
+        power_target_off();  // Turn off nRF52
         power_enter_adaptive_deep_sleep();
         // Never returns
     }
 
-    // Low battery nRF52 protection
-    if (battery.voltage < NRF52_POWER_OFF_VOLTAGE && ENABLE_BATTERY_PROTECTION) {
+    // =========================================================================
+    // STATE: NRF52 POWER DECISION (ONCE)
+    // =========================================================================
+    wake_ctx.state = WAKE_STATE_NRF52_DECISION;
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║  STATE: NRF52 POWER DECISION                               ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
+
+    // Determine if NRF52 should be on based on battery voltage and recovery logic
+    // Uses threshold from config.h (NRF52_POWER_OFF_VOLTAGE = 3.6V)
+    if (wake_ctx.battery.voltage < NRF52_POWER_OFF_VOLTAGE &&
+        ENABLE_BATTERY_PROTECTION) {
+        wake_ctx.nrf52_should_be_on = false;
+
         if (power_target_is_on()) {
-            ESP_LOGW(TAG, "Low battery (%.2fV) - turning off nRF52 radio", battery.voltage);
+            ESP_LOGW(TAG, "Battery (%.2fV) below NRF52 threshold (%.2fV) - turning OFF",
+                    wake_ctx.battery.voltage, NRF52_POWER_OFF_VOLTAGE);
             power_target_off();
+            ESP_LOGI(TAG, "  Recovery requirements:");
+            ESP_LOGI(TAG, "  - Voltage must reach %.2fV (threshold + %.2fV hysteresis)",
+                    NRF52_POWER_OFF_VOLTAGE + NRF52_POWER_ON_HYSTERESIS,
+                    NRF52_POWER_ON_HYSTERESIS);
+            ESP_LOGI(TAG, "  - Must stay off for minimum %d seconds (%.1f min)",
+                    NRF52_MIN_OFF_TIME_SEC, NRF52_MIN_OFF_TIME_SEC / 60.0f);
+            ESP_LOGI(TAG, "  - Will force turn-on after %d seconds (%.1f hours) if voltage marginal",
+                    NRF52_MAX_OFF_TIME_SEC, NRF52_MAX_OFF_TIME_SEC / 3600.0f);
+        } else {
+            ESP_LOGI(TAG, "NRF52 already OFF (battery protection active)");
+            ESP_LOGI(TAG, "  Current voltage: %.2fV", wake_ctx.battery.voltage);
+            ESP_LOGI(TAG, "  Turn-on threshold: %.2fV (%.2fV threshold + %.2fV hysteresis)",
+                    NRF52_POWER_OFF_VOLTAGE + NRF52_POWER_ON_HYSTERESIS,
+                    NRF52_POWER_OFF_VOLTAGE,
+                    NRF52_POWER_ON_HYSTERESIS);
+        }
+    } else {
+        wake_ctx.nrf52_should_be_on = true;
+
+        if (!power_target_is_on()) {
+            ESP_LOGI(TAG, "Battery recovered to %.2fV (above %.2fV threshold)",
+                    wake_ctx.battery.voltage, NRF52_POWER_OFF_VOLTAGE);
+            ESP_LOGI(TAG, "  Turn-on decision made by power_restore_from_deep_sleep():");
+            ESP_LOGI(TAG, "  - Checks voltage >= %.2fV (threshold + hysteresis)",
+                    NRF52_POWER_OFF_VOLTAGE + NRF52_POWER_ON_HYSTERESIS);
+            ESP_LOGI(TAG, "  - Checks minimum off time >= %d sec elapsed",
+                    NRF52_MIN_OFF_TIME_SEC);
+            ESP_LOGI(TAG, "  - OR forces turn-on if off time >= %d sec (%.1f hours)",
+                    NRF52_MAX_OFF_TIME_SEC, NRF52_MAX_OFF_TIME_SEC / 3600.0f);
+
+            if (!power_target_is_on()) {
+                ESP_LOGI(TAG, "  Result: NRF52 remains OFF (recovery conditions not yet met)");
+            }
+        } else {
+            ESP_LOGI(TAG, "NRF52 power: ON (battery sufficient: %.2fV)",
+                    wake_ctx.battery.voltage);
         }
     }
+
+    // =========================================================================
+    // STATE: WIFI SCAN
+    // =========================================================================
+    wake_ctx.state = WAKE_STATE_WIFI_SCAN;
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║  STATE: WIFI SCAN                                          ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "Battery OK (%.2fV) - attempting WiFi connection",
+             wake_ctx.battery.voltage);
 
     // Initialize WiFi manager
     ESP_LOGI(TAG, "Initializing WiFi manager...");
     ESP_ERROR_CHECK(wifi_manager_init());
 
-    // Attempt WiFi connection (tries LR first, then normal)
+    // Single WiFi connection attempt (tries LR first, then normal)
     ESP_LOGI(TAG, "Attempting WiFi connection...");
     if (wifi_manager_connect() != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi connection failed - entering deep sleep");
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "╔════════════════════════════════════════════════════════════╗");
+        ESP_LOGW(TAG, "║  WIFI CONNECTION FAILED - ENTERING DEEP SLEEP              ║");
+        ESP_LOGW(TAG, "╚════════════════════════════════════════════════════════════╝");
+        ESP_LOGI(TAG, "Next wake: %s interval",
+                wake_ctx.battery.is_low ? "Low battery" :
+                wake_ctx.battery.is_critical ? "Critical" : "Normal");
+
+        wake_ctx.state = WAKE_STATE_SLEEP;
         power_enter_adaptive_deep_sleep();
         // Never returns
     }
 
-    // WiFi connected successfully
-    ESP_LOGI(TAG, "✓ WiFi connected successfully");
-    const char* ip = wifi_manager_get_ip();
-    ESP_LOGI(TAG, "IP Address: %s", ip);
-    ESP_LOGI(TAG, "Mode: %s", power_get_wifi_is_lr() ? "ESP-LR" : "Normal");
-    ESP_LOGI(TAG, "SSID: %s", power_get_wifi_ssid());
+    // =========================================================================
+    // STATE: ACTIVE (WiFi Connected)
+    // =========================================================================
+    wake_ctx.state = WAKE_STATE_ACTIVE;
+    wake_ctx.wifi_connected = true;
 
-    // Update global IP
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGW(TAG, "║  WIFI CONNECTED - ENTERING ACTIVE MODE                     ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "");
+
+    const char* ip = wifi_manager_get_ip();
+    ESP_LOGI(TAG, "✓ WiFi connected successfully");
+    ESP_LOGI(TAG, "  IP Address: %s", ip);
+    ESP_LOGI(TAG, "  Mode: %s", power_get_wifi_is_lr() ? "ESP-LR (Long Range)" : "Normal WiFi");
+    ESP_LOGI(TAG, "  SSID: %s", power_get_wifi_ssid());
+    ESP_LOGI(TAG, "");
+
     device_ip = (char*)ip;
 
-    // Start failsafe timer to ensure device returns to sleep cycle
+    // Start failsafe timer
     ESP_LOGI(TAG, "Starting failsafe timer...");
     start_failsafe_timer();
 
@@ -1395,30 +1638,35 @@ void app_main(void) {
     esp_err_t server_result = start_webserver();
     if (server_result == ESP_OK) {
         ESP_LOGI(TAG, "✓ Web server started on port 80");
-        ESP_LOGI(TAG, "=================================");
-        ESP_LOGI(TAG, "Web interface: http://%s", device_ip);
-        ESP_LOGI(TAG, "=================================");
     } else {
-        ESP_LOGE(TAG, "✗ Failed to start web server: %s", esp_err_to_name(server_result));
+        ESP_LOGE(TAG, "✗ Failed to start web server: %s",
+                 esp_err_to_name(server_result));
     }
 
-    // Initialize SWD interface (optional - for initial testing)
-    ESP_LOGI(TAG, "Testing SWD connection...");
-    try_swd_connection();
+    // SWD testing removed - triggers automatically from web interface
 
     // System ready
-    ESP_LOGI(TAG, "=================================");
-    ESP_LOGI(TAG, "=== System Ready ===");
-    ESP_LOGI(TAG, "Web interface: http://%s", device_ip);
-    ESP_LOGI(TAG, "Power: nRF52 is %s", power_target_is_on() ? "ON" : "OFF");
-    ESP_LOGI(TAG, "WiFi: %s mode", power_get_wifi_is_lr() ? "ESP-LR" : "Normal");
-    ESP_LOGI(TAG, "=================================");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║  ACTIVE MODE - SYSTEM READY                                ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "  Web interface: http://%s", device_ip);
+    ESP_LOGI(TAG, "  nRF52 Power: %s", power_target_is_on() ? "ON" : "OFF");
+    ESP_LOGI(TAG, "  WiFi Mode: %s", power_get_wifi_is_lr() ? "ESP-LR" : "Normal");
+    ESP_LOGI(TAG, "  Battery: %.2fV (%.0f%%)",
+             wake_ctx.battery.voltage, wake_ctx.battery.percentage);
+    ESP_LOGI(TAG, "  Wake Count: %lu", wake_ctx.wake_count);
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "");
 
-    // Main monitoring loop
-    TickType_t last_status = xTaskGetTickCount();
+    // =========================================================================
+    // BACKGROUND MONITORING (Active Mode Only)
+    // =========================================================================
+    ESP_LOGI(TAG, "Starting background monitoring (60 second interval)...");
+    TickType_t last_battery_check = xTaskGetTickCount();
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));  // Check every second
+        vTaskDelay(pdMS_TO_TICKS(5000));  // Check every 5 seconds for faster watchdog feed
 
         // ====================================================================
         // CRITICAL: Feed hardware watchdog to prevent reboot
@@ -1426,28 +1674,28 @@ void app_main(void) {
         // ====================================================================
         // power_feed_watchdog();
 
-        // Log status every 10 seconds
-        if ((xTaskGetTickCount() - last_status) > pdMS_TO_TICKS(10000)) {
+        // Battery monitoring every 60 seconds
+        if ((xTaskGetTickCount() - last_battery_check) > pdMS_TO_TICKS(60000)) {
             battery_status_t batt;
             power_get_battery_status(&batt);
 
-            ESP_LOGI(TAG, "Status: Battery=%.2fV (%.0f%%) | WiFi=%s | Wake=%lu | nRF52=%s",
+            ESP_LOGI(TAG, "Active: Battery=%.2fV (%.0f%%) | WiFi=%s | Wake=%lu | nRF52=%s",
                     batt.voltage,
                     batt.percentage,
                     wifi_manager_is_connected() ? "Connected" : "Disconnected",
-                    power_get_wake_count(),
+                    wake_ctx.wake_count,
                     power_target_is_on() ? "ON" : "OFF");
 
-            // Check for low battery condition
+            // Check if battery dropped below threshold during active mode
             if (batt.voltage < NRF52_POWER_OFF_VOLTAGE &&
                 power_target_is_on() &&
                 ENABLE_BATTERY_PROTECTION) {
-                ESP_LOGW(TAG, "Battery dropped below %.2fV - turning off nRF52",
+                ESP_LOGW(TAG, "Battery dropped below %.2fV during active mode - turning off nRF52",
                         NRF52_POWER_OFF_VOLTAGE);
                 power_target_off();
             }
 
-            last_status = xTaskGetTickCount();
+            last_battery_check = xTaskGetTickCount();
         }
     }
 }

@@ -22,9 +22,13 @@ typedef struct {
     // Watchdog settings
     uint32_t watchdog_timeout_sec;  // Hardware watchdog timeout
     bool enable_brownout_detect;    // Enable brownout detection
-    
+
     // Recovery settings
     uint32_t error_cooldown_ms;     // Delay between error retries
+
+    // 24-Hour Absolute Timer
+    uint32_t absolute_reboot_interval_sec;  // Max accumulated uptime before reboot
+    bool enable_absolute_timer;     // Enable/disable absolute timer
 } power_config_t;
 
 // Initialize power management

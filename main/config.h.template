@@ -71,14 +71,35 @@
                                 // (not limited to RTC GPIOs like original ESP32)
 
 // =============================================================================
-// Battery Management
+// Battery Management & Protection Strategy
+// =============================================================================
+// Multi-layer protection approach:
+//
+// Layer 1 (Application - 3.6V): Turn off nRF52 radio to conserve power
+//   - Threshold: NRF52_POWER_OFF_VOLTAGE (default 3.6V)
+//   - Action: Disable nRF52, continue WiFi operation
+//
+// Layer 2 (Application - 3.4V): Critical battery protection
+//   - Threshold: BATTERY_CRITICAL_THRESHOLD (default 3.4V)
+//   - Action: Skip WiFi scan, immediate 12-hour deep sleep
+//
+// Layer 3 (Hardware BMS - 3.0V): Hardware power cutoff
+//   - Battery Management System cuts power completely
+//   - Prevents deep discharge and battery damage
+//   - Acts as fail-safe if software protection fails
+//
+// ESP32 Bootloader Brownout (~2.4V): DISABLED
+//   - Redundant with BMS protection at 3.0V
+//   - Causes boot loops when battery voltage marginal
+//   - Disabled in sdkconfig.defaults
+//
 // =============================================================================
 
 // Battery Voltage Thresholds (LiPo/Li-ion typical values)
 #define BATTERY_HIGH_THRESHOLD 4.1f             // Voltage for "high" battery state
-#define BATTERY_MEDIUM_HIGH_THRESHOLD 3.8f      // Voltage for "medium-high" state  
+#define BATTERY_MEDIUM_HIGH_THRESHOLD 3.8f      // Voltage for "medium-high" state
 #define BATTERY_LOW_THRESHOLD 3.6f              // Voltage for "low" state
-#define BATTERY_CRITICAL_THRESHOLD 3.4f         // Voltage for "critical" state
+#define BATTERY_CRITICAL_THRESHOLD 3.4f         // Voltage for "critical" state (emergency sleep)
 
 // =============================================================================
 // Deep Sleep Configuration
@@ -98,13 +119,69 @@
 // #define DEEP_SLEEP_CRITICAL_SEC 60           // 1 minute for testing
 
 // =============================================================================
+// 24-Hour Absolute Reboot Timer
+// =============================================================================
+
+// Maximum accumulated uptime before forced reboot (seconds)
+// This timer survives deep sleep and tracks total awake time
+// After this time, device will force reboot to reset all state
+
+#define ABSOLUTE_REBOOT_INTERVAL_SEC (24 * 60 * 60)  // 24 hours (production)
+// #define ABSOLUTE_REBOOT_INTERVAL_SEC 300           // 5 minutes (testing)
+
+// When to enable the absolute timer
+#define ENABLE_ABSOLUTE_REBOOT_TIMER true            // Master enable switch
+
+// Note: This is different from the failsafe timer
+// - Absolute timer: Total accumulated uptime across sleep/wake cycles
+// - Failsafe timer: Time awake after WiFi connects
+
+// =============================================================================
+// Brownout Recovery Protection
+// =============================================================================
+
+// Brownout loop detection and recovery settings
+// If device brownouts during boot (before battery check can run),
+// it will enter extended deep sleep to allow battery recovery
+
+#define BROWNOUT_LOOP_THRESHOLD 3           // Trigger after 3 consecutive brownouts
+#define BROWNOUT_RECOVERY_SLEEP_SEC 86400   // 24 hours (full solar day/night cycle)
+
+// For testing, use shorter interval:
+// #define BROWNOUT_RECOVERY_SLEEP_SEC 300  // 5 minutes
+
+// Time window to consider brownouts as "consecutive"
+#define BROWNOUT_RESET_WINDOW_SEC 600       // 10 minutes
+
+// =============================================================================
 // nRF52 Radio Power Management
 // =============================================================================
 
 // Automatic power-off when battery is low
 #define NRF52_POWER_OFF_VOLTAGE 3.6f            // Turn off nRF52 below this voltage
-#define NRF52_POWER_OFF_SEC 43200                // Keep off for 12 hours (43200 sec)
-                                                 // Testing: use 60 for 1 minute
+
+// Hysteresis for turn-on (prevents rapid on/off cycling)
+#define NRF52_POWER_ON_HYSTERESIS 0.1f          // Battery must be this much ABOVE threshold to turn back on
+                                                 // Example: 3.6V + 0.1V = 3.7V to turn on
+                                                 // Smaller = faster recovery, Larger = more stable
+
+// Minimum off time before allowing turn-on (prevents rapid cycling)
+#define NRF52_MIN_OFF_TIME_SEC 300              // 5 minutes minimum (prevents bounce)
+                                                 // Battery must be good for at least this long
+
+// Maximum off time - after this, try turning on even if battery marginal
+#define NRF52_MAX_OFF_TIME_SEC 43200            // 12 hours maximum (full solar day/night cycle)
+                                                 // After this time, give up waiting and try turning on
+
+// Testing values (uncomment for quick iteration):
+// #define NRF52_POWER_ON_HYSTERESIS 0.05f      // Small hysteresis for testing
+// #define NRF52_MIN_OFF_TIME_SEC 60            // 1 minute for quick tests
+// #define NRF52_MAX_OFF_TIME_SEC 600           // 10 minutes for testing
+
+// Note: NRF52_POWER_OFF_SEC is DEPRECATED - use the values above instead
+// The old NRF52_POWER_OFF_SEC (12 hour fixed timeout) is replaced by:
+// - NRF52_MIN_OFF_TIME_SEC: minimum time before considering turn-on
+// - NRF52_MAX_OFF_TIME_SEC: maximum time to wait before forcing turn-on attempt
 
 // =============================================================================
 // Feature Flags

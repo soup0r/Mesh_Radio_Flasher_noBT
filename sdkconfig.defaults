@@ -17,7 +17,7 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_SIZE=y
 
 # WiFi resilience settings (applies to both ESP-LR and normal modes)
-CONFIG_ESP_WIFI_STA_BEACON_TIMEOUT=30
+CONFIG_ESP_WIFI_STA_BEACON_TIMEOUT=10
 CONFIG_ESP_WIFI_AUTH_WPA2_PSK=y
 CONFIG_ESP_WIFI_AUTH_WPA3_PSK=y
 CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=y
@@ -55,3 +55,17 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_c3.csv"
 CONFIG_LWIP_TCP_WND_DEFAULT=65535
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+
+# =============================================================================
+# Brownout Detection Configuration
+# =============================================================================
+# DISABLED: Hardware BMS cuts power at ~3.0V, making ESP32's 2.4V brownout
+# detector redundant. Application-level battery protection (3.4-3.6V) provides
+# proper power management before reaching BMS cutoff.
+#
+# With BMS protection:
+# - Application checks battery at 3.6V (turn off nRF52)
+# - Application checks battery at 3.4V (critical, immediate sleep)
+# - BMS cuts power at 3.0V (hardware protection)
+# - ESP32 brownout at 2.4V never reached (disabled)
+CONFIG_ESP_BROWNOUT_DET=n
