@@ -503,22 +503,51 @@ bool swd_is_connected(void) {
     return true;
 }
 
-// Reset target using reset pin
+/**
+ * @brief Reset target device via hardware reset pin
+ *
+ * Asserts nRST, waits for target to reset, then attempts reconnection.
+ * Includes proper backoff to avoid hammering the DP while target is resetting.
+ *
+ * @return ESP_OK on success, error code on failure
+ */
 esp_err_t swd_reset_target(void) {
     if (config.pin_reset < 0) {
         ESP_LOGW(TAG, "No reset pin configured");
         return ESP_ERR_NOT_SUPPORTED;
     }
-    
+
     ESP_LOGI(TAG, "Resetting target...");
-    
-    gpio_set_level((gpio_num_t)config.pin_reset, 0);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level((gpio_num_t)config.pin_reset, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    // Reconnect after reset
-    return swd_connect();
+
+    // Assert hardware reset
+    gpio_set_level((gpio_num_t)config.pin_reset, 0);  // LOW = Reset asserted
+    vTaskDelay(pdMS_TO_TICKS(10));  // Hold reset for 10ms
+    gpio_set_level((gpio_num_t)config.pin_reset, 1);  // HIGH = Release reset
+
+    // CRITICAL: Wait for target to complete reset sequence
+    // Don't poll during this time - target is not responding
+    ESP_LOGI(TAG, "Waiting for target reset to complete...");
+    vTaskDelay(pdMS_TO_TICKS(50));  // 50ms reset recovery time
+
+    // Now target should be ready - attempt clean reconnection
+    ESP_LOGI(TAG, "Attempting reconnection after reset...");
+
+    // Try to read IDCODE as a connectivity test
+    uint32_t idcode = 0;
+    esp_err_t ret = swd_dp_read(DP_IDCODE, &idcode);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Initial IDCODE read failed after reset, retrying...");
+        vTaskDelay(pdMS_TO_TICKS(50));  // Additional backoff
+        ret = swd_dp_read(DP_IDCODE, &idcode);
+    }
+
+    if (ret == ESP_OK && idcode != 0 && idcode != 0xFFFFFFFF) {
+        ESP_LOGI(TAG, "Target reset complete, IDCODE: 0x%08lX", idcode);
+        return ESP_OK;
+    } else {
+        ESP_LOGE(TAG, "Target not responding after reset (IDCODE: 0x%08lX)", idcode);
+        return ESP_FAIL;
+    }
 }
 
 // Clear sticky errors
@@ -536,42 +565,63 @@ uint32_t swd_get_idcode(void) {
     return idcode;
 }
 
-// Power up debug domain
+/**
+ * @brief Power up debug domain
+ *
+ * Requests debug power and waits for acknowledgment with proper backoff.
+ *
+ * @return ESP_OK on success
+ */
 esp_err_t swd_power_up(void) {
     ESP_LOGI(TAG, "Powering up debug domain...");
-    
+
     // Clear any errors first
     swd_clear_errors();
-    
-    // Request debug and system power
+
+    // Request debug and system power (CDBGPWRUPREQ | CSYSPWRUPREQ)
     esp_err_t ret = swd_dp_write(DP_CTRL_STAT, 0x50000000);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to request power");
         return ret;
     }
-    
-    // Wait for power up acknowledgment with longer timeout
-    for (int i = 0; i < 200; i++) {  // Increased timeout
-        uint32_t status = 0;
+
+    // CRITICAL: Initial delay before first poll
+    // Give hardware time to respond before we start checking
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // Poll for power-up acknowledgment with exponential backoff
+    uint32_t status = 0;
+    for (int retry = 0; retry < 20; retry++) {
         ret = swd_dp_read(DP_CTRL_STAT, &status);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to read CTRL_STAT during power-up");
-            // Don't return error, keep trying
+            ESP_LOGW(TAG, "CTRL/STAT read failed during power-up (retry %d)", retry);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
         }
-        
-        // Check CSYSPWRUPACK and CDBGPWRUPACK
-        if ((status & 0xA0000000) == 0xA0000000) {
+
+        // Check if both power domains are up (CDBGPWRUPACK | CSYSPWRUPACK)
+        bool cdbg_up = (status & 0x20000000) != 0;
+        bool csys_up = (status & 0x80000000) != 0;
+
+        if (cdbg_up && csys_up) {
             ESP_LOGI(TAG, "Debug powered up: status=0x%08lX", status);
-            
+
             // Clear any sticky errors that might have occurred during power-up
             swd_clear_errors();
             return ESP_OK;
         }
-        
-        vTaskDelay(pdMS_TO_TICKS(5));
+
+        // Exponential backoff: 5ms, 10ms, 20ms, 40ms, ...
+        uint32_t delay_ms = 5 << (retry / 4);  // Increases every 4 retries
+        if (delay_ms > 100) delay_ms = 100;    // Cap at 100ms
+
+        ESP_LOGD(TAG, "Waiting for power-up ack (retry %d, delay %lums): CDBG=%d CSYS=%d",
+                retry, delay_ms, cdbg_up, csys_up);
+
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
-    
-    ESP_LOGE(TAG, "Power up timeout");
+
+    ESP_LOGE(TAG, "Debug power-up timeout (final status: 0x%08lX)", status);
     return ESP_ERR_TIMEOUT;
 }
 

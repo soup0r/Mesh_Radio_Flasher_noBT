@@ -119,22 +119,32 @@
 // #define DEEP_SLEEP_CRITICAL_SEC 60           // 1 minute for testing
 
 // =============================================================================
-// 24-Hour Absolute Reboot Timer
+// Absolute Uptime Timer (Scheduled Maintenance Reboot)
 // =============================================================================
+// Forces a reboot after accumulated uptime exceeds the configured interval.
+// This ensures the device reboots periodically for stability, even if WiFi
+// stays connected indefinitely.
+//
+// The timer tracks TOTAL ACCUMULATED AWAKE TIME across all wake/sleep cycles.
+// Example: If set to 86400 sec (24 hours):
+//   - Wake 1: Active 1 hour, sleep 1 hour (accumulated: 1 hour)
+//   - Wake 2: Active 2 hours, sleep 1 hour (accumulated: 3 hours)
+//   - ... continues until 24 hours of awake time reached
+//   - Then: Forced reboot for maintenance
+//
+// This is independent of the WiFi failsafe timer and will trigger even if
+// WiFi is connected and stable.
 
-// Maximum accumulated uptime before forced reboot (seconds)
-// This timer survives deep sleep and tracks total awake time
-// After this time, device will force reboot to reset all state
+#define ENABLE_ABSOLUTE_REBOOT_TIMER true   // Enable scheduled maintenance reboots
+#define ABSOLUTE_REBOOT_INTERVAL_SEC 86400  // 24 hours (default for production)
 
-#define ABSOLUTE_REBOOT_INTERVAL_SEC (24 * 60 * 60)  // 24 hours (production)
-// #define ABSOLUTE_REBOOT_INTERVAL_SEC 300           // 5 minutes (testing)
+// Testing values (uncomment for quick iteration):
+// #define ABSOLUTE_REBOOT_INTERVAL_SEC 300   // 5 minutes for testing
+// #define ABSOLUTE_REBOOT_INTERVAL_SEC 600   // 10 minutes for testing
+// #define ABSOLUTE_REBOOT_INTERVAL_SEC 3600  // 1 hour for testing
 
-// When to enable the absolute timer
-#define ENABLE_ABSOLUTE_REBOOT_TIMER true            // Master enable switch
-
-// Note: This is different from the failsafe timer
-// - Absolute timer: Total accumulated uptime across sleep/wake cycles
-// - Failsafe timer: Time awake after WiFi connects
+// Note: This measures accumulated AWAKE time, not wall-clock time.
+// Device sleeping does not count toward this timer.
 
 // =============================================================================
 // Brownout Recovery Protection
@@ -182,6 +192,23 @@
 // The old NRF52_POWER_OFF_SEC (12 hour fixed timeout) is replaced by:
 // - NRF52_MIN_OFF_TIME_SEC: minimum time before considering turn-on
 // - NRF52_MAX_OFF_TIME_SEC: maximum time to wait before forcing turn-on attempt
+
+// =============================================================================
+// GPIO Settling Time (for default-ON MOSFET hardware)
+// =============================================================================
+// Time to wait after GPIO state change before considering it stable.
+// Default-ON MOSFET hardware has external pull resistor that fights GPIO
+// during transitions, requiring settling time before reliable readback.
+//
+// Typical values:
+// - Small gate capacitance + weak pull: 2-5ms
+// - Large gate capacitance + strong pull: 5-10ms
+// - If you see "readback mismatch" warnings: increase this
+//
+// Note: This is separate from nRF52 power-on delay.
+// GPIO settling happens first, then power-on sequence.
+
+#define GPIO_SETTLING_DELAY_MS 5  // Milliseconds to wait after GPIO change
 
 // =============================================================================
 // Feature Flags

@@ -7,6 +7,15 @@
 #include "esp_err.h"
 
 
+// SWD timing configuration
+#define SWD_RESET_HOLD_MS           10      // nRST hold time
+#define SWD_RESET_RECOVERY_MS       50      // Time for target to complete reset
+#define SWD_POWER_UP_INITIAL_MS     10      // Initial delay before polling power-up
+#define SWD_POWER_UP_POLL_MS        5       // Base poll interval for power-up
+#define SWD_FLASH_ERASE_INITIAL_MS  500     // Initial wait for erase before polling
+#define SWD_FLASH_ERASE_POLL_MS     100     // Poll interval during erase (from pyOCD)
+#define SWD_POST_ERASE_STABLE_MS    100     // Stabilization time after erase
+
 // SWD Configuration
 typedef struct {
     int pin_swclk;

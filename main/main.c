@@ -1462,14 +1462,14 @@ void app_main(void) {
     init_system();
 
     // ========================================================================
-    // CRITICAL: Check 24-hour absolute timer immediately after init
-    // This MUST be called before any operations that could hang
-    // Will force reboot if accumulated uptime exceeds configured interval
-    // This is the ultimate safety mechanism for bulletproof operation
+    // CRITICAL: Check absolute uptime timer immediately after init
+    // This MUST be called before any operations that could hang or take time
+    // Will force reboot if accumulated awake time exceeds configured interval
+    // This is a scheduled maintenance mechanism for long-term stability
     // ========================================================================
-    ESP_LOGI(TAG, "Checking 24-hour absolute timer...");
+    ESP_LOGI(TAG, "Checking absolute uptime timer...");
     power_check_absolute_timer();  // Will reboot if exceeded, otherwise continues
-    ESP_LOGI(TAG, "24-hour timer check complete");
+    ESP_LOGI(TAG, "Absolute timer check complete");
 
     // Restore state if waking from deep sleep
     if (wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
@@ -1664,9 +1664,20 @@ void app_main(void) {
     // =========================================================================
     ESP_LOGI(TAG, "Starting background monitoring (60 second interval)...");
     TickType_t last_battery_check = xTaskGetTickCount();
+    TickType_t last_absolute_timer_check = xTaskGetTickCount();
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));  // Check every 5 seconds for faster watchdog feed
+        vTaskDelay(pdMS_TO_TICKS(5000));  // Check every 5 seconds
+
+        // ====================================================================
+        // CRITICAL: Check absolute uptime timer (every 60 seconds)
+        // Ensures scheduled reboot happens even during long WiFi sessions
+        // This is independent of WiFi failsafe timer
+        // ====================================================================
+        if ((xTaskGetTickCount() - last_absolute_timer_check) > pdMS_TO_TICKS(60000)) {
+            power_check_absolute_timer();  // Will reboot if threshold exceeded
+            last_absolute_timer_check = xTaskGetTickCount();
+        }
 
         // ====================================================================
         // CRITICAL: Feed hardware watchdog to prevent reboot
@@ -1679,12 +1690,28 @@ void app_main(void) {
             battery_status_t batt;
             power_get_battery_status(&batt);
 
-            ESP_LOGI(TAG, "Active: Battery=%.2fV (%.0f%%) | WiFi=%s | Wake=%lu | nRF52=%s",
-                    batt.voltage,
-                    batt.percentage,
-                    wifi_manager_is_connected() ? "Connected" : "Disconnected",
-                    wake_ctx.wake_count,
-                    power_target_is_on() ? "ON" : "OFF");
+            // Get absolute timer status if enabled
+            uint64_t accumulated, limit, remaining;
+            if (power_get_absolute_timer_status(&accumulated, &limit, &remaining) == ESP_OK) {
+                uint64_t acc_min = accumulated / 60;
+                uint64_t lim_min = limit / 60;
+
+                ESP_LOGI(TAG, "Active: Battery=%.2fV (%.0f%%) | WiFi=%s | Wake=%lu | nRF52=%s | Uptime=%llu/%llum",
+                        batt.voltage,
+                        batt.percentage,
+                        wifi_manager_is_connected() ? "Connected" : "Disconnected",
+                        wake_ctx.wake_count,
+                        power_target_is_on() ? "ON" : "OFF",
+                        acc_min,
+                        lim_min);
+            } else {
+                ESP_LOGI(TAG, "Active: Battery=%.2fV (%.0f%%) | WiFi=%s | Wake=%lu | nRF52=%s",
+                        batt.voltage,
+                        batt.percentage,
+                        wifi_manager_is_connected() ? "Connected" : "Disconnected",
+                        wake_ctx.wake_count,
+                        power_target_is_on() ? "ON" : "OFF");
+            }
 
             // Check if battery dropped below threshold during active mode
             if (batt.voltage < NRF52_POWER_OFF_VOLTAGE &&

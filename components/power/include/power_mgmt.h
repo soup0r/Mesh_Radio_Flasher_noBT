@@ -101,9 +101,9 @@ void power_set_wifi_info(bool is_lr, const char* ssid);
 bool power_get_wifi_is_lr(void);
 const char* power_get_wifi_ssid(void);
 
-// 24-hour absolute timer functions
+// Absolute uptime timer (scheduled maintenance reboot)
 esp_err_t power_check_absolute_timer(void);
-void power_get_absolute_timer_status(uint64_t *uptime_sec, uint64_t *remaining_sec);
+esp_err_t power_get_absolute_timer_status(uint64_t *accumulated_sec, uint64_t *limit_sec, uint64_t *remaining_sec);
 void power_reset_absolute_timer(void);
 
 // Hardware watchdog functions
