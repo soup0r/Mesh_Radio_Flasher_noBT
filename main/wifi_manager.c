@@ -63,8 +63,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Got IP address: %s", current_ip);
         xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
         current_state = WIFI_STATE_CONNECTED;
-        power_reset_wake_count();
-        // Clear is_connecting when we get IP
+        // Wake count managed automatically in RTC memory
         is_connecting = false;
     }
 }

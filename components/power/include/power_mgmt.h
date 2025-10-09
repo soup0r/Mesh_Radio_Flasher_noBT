@@ -12,13 +12,13 @@ typedef struct {
     int target_power_gpio;      // GPIO for MOSFET/transistor control
     uint32_t power_on_delay_ms; // Delay after power on
     uint32_t reset_hold_ms;     // Reset pulse duration
-    
+
     // Deep sleep settings
     uint32_t sleep_duration_sec;    // Deep sleep duration
     uint32_t wifi_check_interval_ms; // How often to check WiFi in active mode
     uint32_t wifi_timeout_ms;       // Max time to wait for WiFi connection
     const char *wake_ssid;          // SSID to check for wake condition
-    
+
     // Watchdog settings
     uint32_t watchdog_timeout_sec;  // Hardware watchdog timeout
     bool enable_brownout_detect;    // Enable brownout detection
@@ -39,12 +39,10 @@ esp_err_t power_target_on(void);
 esp_err_t power_target_off(void);
 esp_err_t power_target_reset(void);
 esp_err_t power_target_cycle(uint32_t off_time_ms);
-// Get current power status
 bool power_target_is_on(void);
+
 // Prepare for deep sleep (hold GPIO state)
 void power_prepare_for_sleep(void);
-// Restore after wake from deep sleep
-void power_restore_after_sleep(void);
 
 // Battery monitoring
 typedef struct {
@@ -70,7 +68,6 @@ uint64_t calculate_sleep_duration_us(float battery_voltage);
 
 // Helper functions for deep sleep management
 uint32_t power_get_wake_count(void);
-void power_reset_wake_count(void);
 
 // Wake reason
 typedef enum {
@@ -83,19 +80,6 @@ typedef enum {
 
 wake_reason_t power_get_wake_reason(void);
 
-// Recovery mechanisms
-typedef struct {
-    uint32_t swd_failures;
-    uint32_t flash_failures;
-    uint32_t network_failures;
-    uint32_t watchdog_resets;
-    uint32_t brownout_resets;
-    uint32_t total_resets;
-    uint32_t uptime_seconds;
-} system_health_t;
-
-void power_get_health_status(system_health_t *health);
-
 // WiFi connection info functions
 void power_set_wifi_info(bool is_lr, const char* ssid);
 bool power_get_wifi_is_lr(void);
@@ -104,10 +88,5 @@ const char* power_get_wifi_ssid(void);
 // Absolute uptime timer (scheduled maintenance reboot)
 esp_err_t power_check_absolute_timer(void);
 esp_err_t power_get_absolute_timer_status(uint64_t *accumulated_sec, uint64_t *limit_sec, uint64_t *remaining_sec);
-void power_reset_absolute_timer(void);
-
-// Hardware watchdog functions
-esp_err_t power_init_hardware_watchdog(void);
-void power_feed_watchdog(void);
 
 #endif // POWER_MGMT_H

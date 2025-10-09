@@ -3,7 +3,6 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -29,16 +28,9 @@
 
 static const char *TAG = "FLASHER";
 
-// Event group for system state
-static EventGroupHandle_t system_events;
-#define SWD_CONNECTED_BIT   BIT1
-
 // Global variables
 static char* device_ip = "Not connected";
 static httpd_handle_t web_server = NULL;
-
-// Global state
-static bool swd_initialized = false;
 
 // Failsafe reboot timer (CRITICAL: ensures device returns to sleep/wake cycle)
 static TaskHandle_t failsafe_task_handle = NULL;
@@ -71,9 +63,6 @@ typedef struct {
 static void init_system(void);
 static void init_storage(void);
 static void system_health_task(void *arg);
-static esp_err_t try_swd_connection(void);
-static void test_swd_functions(void);
-static void test_memory_regions(void);
 static esp_err_t start_webserver(void);
 void stop_webserver(void);  // Made global for wifi_manager cleanup
 static esp_err_t release_swd_handler(httpd_req_t *req);
@@ -701,56 +690,37 @@ static esp_err_t root_handler(httpd_req_t *req) {
         ""
         "function uploadFirmware() {"
         "  const file = document.getElementById('hexFile').files[0];"
-        "  if (!file) {"
-        "    alert('Please select a hex file');"
-        "    return;"
-        "  }"
+        "  if (!file) { alert('Please select a hex file'); return; }"
+        "  "
         "  document.querySelector('#uploadBtn').disabled = true;"
-        "  document.getElementById('status').innerText = 'Uploading firmware...';"
+        "  document.getElementById('status').innerText = 'Uploading...';"
         "  document.getElementById('progressBar').style.width = '0%';"
         "  "
         "  const xhr = new XMLHttpRequest();"
-        "  "
         "  xhr.upload.onprogress = function(e) {"
         "    if (e.lengthComputable) {"
-        "      const percent = Math.round((e.loaded / e.total) * 100);"
-        "      document.getElementById('progressBar').style.width = percent + '%';"
-        "      document.getElementById('status').innerText = 'Uploading: ' + percent + '%';"
+        "      const pct = Math.round((e.loaded / e.total) * 100);"
+        "      document.getElementById('progressBar').style.width = pct + '%';"
+        "      document.getElementById('status').innerText = 'Progress: ' + pct + '%';"
         "    }"
         "  };"
         "  "
-        "  xhr.onload = async function() {"
+        "  xhr.onload = function() {"
         "    if (xhr.status === 200) {"
-        "      document.getElementById('status').innerText = 'Upload complete, starting flash...';"
-        "      "
-        "      fetch('/flash_stored', {method: 'POST'});"
-        "      "
-        "      const pollInterval = setInterval(async function() {"
-        "        const statusResp = await fetch('/flash_status');"
-        "        const status = await statusResp.json();"
-        "        "
-        "        document.getElementById('progressBar').style.width = status.percent + '%';"
-        "        document.getElementById('status').innerText = status.status;"
-        "        "
-        "        if (!status.in_progress) {"
-        "          clearInterval(pollInterval);"
-        "          if (status.status.includes('complete')) {"
-        "            document.getElementById('status').innerText = '✓ ' + status.status;"
-        "          }"
-        "          document.querySelector('#uploadBtn').disabled = false;"
-        "        }"
-        "      }, 1000);"
+        "      document.getElementById('progressBar').style.width = '100%';"
+        "      document.getElementById('status').innerText = '✓ Upload complete!';"
         "    } else {"
-        "      document.getElementById('status').innerText = 'Upload failed';"
-        "      document.querySelector('#uploadBtn').disabled = false;"
+        "      document.getElementById('status').innerText = '✗ Failed (HTTP ' + xhr.status + ')';"
         "    }"
-        "  };"
-        "  "
-        "  xhr.onerror = function() {"
-        "    document.getElementById('status').innerText = 'Upload error';"
         "    document.querySelector('#uploadBtn').disabled = false;"
         "  };"
         "  "
+        "  xhr.onerror = function() {"
+        "    document.getElementById('status').innerText = '✗ Upload error';"
+        "    document.querySelector('#uploadBtn').disabled = false;"
+        "  };"
+        "  "
+        "  xhr.timeout = 300000;"
         "  xhr.open('POST', '/upload');"
         "  xhr.send(file);"
         "}"
@@ -816,6 +786,33 @@ static esp_err_t root_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Failsafe status endpoint
+static esp_err_t failsafe_status_handler(httpd_req_t *req) {
+    char resp[256];
+
+    bool is_armed = failsafe_armed;
+    uint32_t remaining = 0;
+
+    if (is_armed && failsafe_start_time > 0) {
+        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+        uint32_t elapsed = current_time - failsafe_start_time;
+
+        if (elapsed < MAX_UPTIME_AFTER_WIFI_SEC) {
+            remaining = MAX_UPTIME_AFTER_WIFI_SEC - elapsed;
+        }
+    }
+
+    snprintf(resp, sizeof(resp),
+        "{\"armed\":%s,\"remaining_sec\":%lu,\"limit_sec\":%d}",
+        is_armed ? "true" : "false",
+        remaining,
+        MAX_UPTIME_AFTER_WIFI_SEC);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, strlen(resp));
+    return ESP_OK;
+}
+
 static esp_err_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
@@ -840,8 +837,16 @@ static esp_err_t start_webserver(void) {
             .user_ctx = NULL
         };
 
+        httpd_uri_t failsafe_uri = {
+            .uri = "/failsafe_status",
+            .method = HTTP_GET,
+            .handler = failsafe_status_handler,
+            .user_ctx = NULL
+        };
+
         httpd_register_uri_handler(web_server, &root_uri);
         httpd_register_uri_handler(web_server, &release_uri);
+        httpd_register_uri_handler(web_server, &failsafe_uri);
         register_upload_handlers(web_server);
         register_power_handlers(web_server);
 
@@ -864,266 +869,33 @@ void stop_webserver(void) {
     }
 }
 
-// Comprehensive memory testing
-static void test_memory_regions(void) {
-    if (!swd_is_connected()) {
-        ESP_LOGW(TAG, "SWD not connected for memory testing");
-        return;
-    }
-    
-    ESP_LOGI(TAG, "=== Comprehensive Memory Test ===");
-    
-    uint32_t data;
-    
-    // Test Flash regions
-    ESP_LOGI(TAG, "--- Flash Memory Test ---");
-    uint32_t flash_addrs[] = {
-        0x00000000,  // Start of flash (reset vector)
-        0x00001000,  // Typical bootloader location
-        0x00010000,  // Application start
-        0x000FC000,  // Near end of 1MB flash
-    };
-    
-    for (int i = 0; i < 4; i++) {
-        if (swd_mem_read32(flash_addrs[i], &data) == ESP_OK) {
-            ESP_LOGI(TAG, "Flash[0x%08lX] = 0x%08lX", flash_addrs[i], data);
-        } else {
-            ESP_LOGE(TAG, "Failed to read Flash[0x%08lX]", flash_addrs[i]);
-        }
-    }
-    
-    // Test RAM regions
-    ESP_LOGI(TAG, "--- RAM Memory Test ---");
-    uint32_t ram_addrs[] = {
-        0x20000000,  // Start of RAM
-        0x20000100,  // Safe test area
-        0x20001000,  // 4KB into RAM
-        0x2003FF00,  // Near end of 256KB RAM
-    };
-    
-    for (int i = 0; i < 4; i++) {
-        if (swd_mem_read32(ram_addrs[i], &data) == ESP_OK) {
-            ESP_LOGI(TAG, "RAM[0x%08lX] = 0x%08lX", ram_addrs[i], data);
-            
-            // Try write test on safe area only
-            if (ram_addrs[i] == 0x20000100) {
-                uint32_t test_patterns[] = {0xDEADBEEF, 0x12345678, 0xAAAA5555};
-                for (int j = 0; j < 3; j++) {
-                    if (swd_mem_write32(ram_addrs[i], test_patterns[j]) == ESP_OK) {
-                        uint32_t readback;
-                        if (swd_mem_read32(ram_addrs[i], &readback) == ESP_OK) {
-                            if (readback == test_patterns[j]) {
-                                ESP_LOGI(TAG, "  ✓ Pattern 0x%08lX verified", test_patterns[j]);
-                            } else {
-                                ESP_LOGE(TAG, "  ✗ Pattern failed: wrote 0x%08lX, read 0x%08lX", 
-                                        test_patterns[j], readback);
-                            }
-                        }
-                    }
-                }
-                // Restore original
-                swd_mem_write32(ram_addrs[i], data);
-            }
-        } else {
-            ESP_LOGE(TAG, "Failed to read RAM[0x%08lX]", ram_addrs[i]);
-        }
-    }
-    
-    // Test Peripheral regions
-    ESP_LOGI(TAG, "--- Peripheral Memory Test ---");
-    struct {
-        uint32_t addr;
-        const char *name;
-    } periph_regs[] = {
-        {0x40000000, "CLOCK"},
-        {0x40001000, "RADIO"},
-        {0x40002000, "UARTE0"},
-        {0x40003000, "SPIM0/SPIS0/TWIM0/TWIS0"},
-        {0x4001E000, "NVMC"},
-        {0x40024000, "SPIM2/SPIS2"},
-        {0x4002D000, "USBD"},
-        {0x50000000, "GPIO P0"},
-        {0x50000300, "GPIO P1"},
-    };
-    
-    for (int i = 0; i < 9; i++) {
-        if (swd_mem_read32(periph_regs[i].addr, &data) == ESP_OK) {
-            ESP_LOGI(TAG, "%s[0x%08lX] = 0x%08lX", 
-                    periph_regs[i].name, periph_regs[i].addr, data);
-        }
-    }
-    
-    // Read Device ID and info
-    ESP_LOGI(TAG, "--- Device Information ---");
-    uint32_t deviceid[2];
-    if (swd_mem_read32(FICR_DEVICEID0, &deviceid[0]) == ESP_OK &&
-        swd_mem_read32(FICR_DEVICEID1, &deviceid[1]) == ESP_OK) {
-        ESP_LOGI(TAG, "Device ID: 0x%08lX%08lX", deviceid[1], deviceid[0]);
-    }
-    
-    // Read MAC address
-    uint32_t mac[2];
-    if (swd_mem_read32(FICR_DEVICEADDR0, &mac[0]) == ESP_OK &&
-        swd_mem_read32(FICR_DEVICEADDR1, &mac[1]) == ESP_OK) {
-        ESP_LOGI(TAG, "BLE MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-                (uint8_t)(mac[1] >> 8), (uint8_t)mac[1],
-                (uint8_t)(mac[0] >> 24), (uint8_t)(mac[0] >> 16),
-                (uint8_t)(mac[0] >> 8), (uint8_t)mac[0]);
-    }
-    
-    ESP_LOGI(TAG, "=== Memory Test Complete ===");
-}
+// SWD connection function removed - SWD initializes on-demand when web interface requests it
+// This reduces boot time and prevents unnecessary target interference
 
-// Enhanced WiFi connection with LR and normal fallback
-
-
-// Test SWD functions
-static void test_swd_functions(void) {
-    if (!swd_is_connected()) {
-        ESP_LOGW(TAG, "SWD not connected for testing");
-        return;
-    }
-    
-    ESP_LOGI(TAG, "=== SWD Function Test ===");
-    
-    uint32_t data;
-    
-    // Read device info
-    if (swd_mem_read32(FICR_INFO_PART, &data) == ESP_OK) {
-        ESP_LOGI(TAG, "Part Number: 0x%08lX (nRF52840)", data);
-    }
-    
-    if (swd_mem_read32(FICR_INFO_RAM, &data) == ESP_OK) {
-        ESP_LOGI(TAG, "RAM Size: %lu KB", data);
-    }
-    
-    if (swd_mem_read32(FICR_INFO_FLASH, &data) == ESP_OK) {
-        ESP_LOGI(TAG, "Flash Size: %lu KB", data);
-    }
-    
-    // Check protection
-    if (swd_mem_read32(UICR_APPROTECT, &data) == ESP_OK) {
-        if (data == 0xFFFFFF5A) {
-            ESP_LOGI(TAG, "APPROTECT: 0x%08lX (DISABLED - Good!)", data);
-        } else {
-            ESP_LOGW(TAG, "APPROTECT: 0x%08lX (ENABLED - Flash operations restricted)", data);
-        }
-    }
-    
-    ESP_LOGI(TAG, "=== SWD Test Complete ===");
-}
-
-// SWD connection with retry logic
-static esp_err_t try_swd_connection(void) {
-    ESP_LOGI(TAG, "=== Starting SWD Connection Attempt ===");
-    
-    if (swd_initialized && swd_is_connected()) {
-        ESP_LOGI(TAG, "SWD already connected");
-        return ESP_OK;
-    }
-    
-    ESP_LOGI(TAG, "Attempting SWD connection...");
-    
-    if (!swd_initialized) {
-        ESP_LOGI(TAG, "Initializing SWD interface...");
-        
-        swd_config_t swd_cfg = {
-            .pin_swclk = SWD_PIN_SWCLK,
-            .pin_swdio = SWD_PIN_SWDIO,
-            .pin_reset = SWD_PIN_RESET,
-            .delay_cycles = 0
-        };
-        
-        esp_err_t ret = swd_init(&swd_cfg);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "SWD init failed: %s (0x%x)", esp_err_to_name(ret), ret);
-            return ret;
-        }
-        ESP_LOGI(TAG, "SWD interface initialized");
-        swd_initialized = true;
-    }
-    
-    ESP_LOGI(TAG, "Trying direct connection...");
-    esp_err_t ret = swd_connect();
-    
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Direct connect failed, trying reset...");
-        ret = swd_reset_target();
-        if (ret == ESP_OK) {
-            ret = swd_connect();
-        }
-    }
-    
-    if (ret == ESP_OK) {
-        xEventGroupSetBits(system_events, SWD_CONNECTED_BIT);
-        ESP_LOGI(TAG, "✓ SWD connected successfully!");
-        
-        uint32_t idcode = swd_get_idcode();
-        ESP_LOGI(TAG, "Target IDCODE: 0x%08lX", idcode);
-        
-        ret = swd_flash_init();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Flash init failed: %s", esp_err_to_name(ret));
-        } else {
-            ESP_LOGI(TAG, "Flash interface initialized");
-        }
-        
-        test_swd_functions();
-        test_memory_regions();  // Run comprehensive memory test on connection
-        ESP_LOGI(TAG, "Initial test complete, shutting down SWD to release target...");
-        swd_shutdown();
-        xEventGroupClearBits(system_events, SWD_CONNECTED_BIT);
-        ESP_LOGI(TAG, "SWD shutdown - target released for normal operation");
-    } else {
-        xEventGroupClearBits(system_events, SWD_CONNECTED_BIT);
-        ESP_LOGE(TAG, "✗ SWD connection failed with error: 0x%x", ret);
-        swd_shutdown();
-    }
-
-    if (ret == ESP_OK) {
-    // Check APPROTECT status
-        uint32_t approtect;
-        if (swd_mem_read32(UICR_APPROTECT, &approtect) == ESP_OK) {
-            if (approtect == 0xFFFFFFFF) {
-                ESP_LOGW(TAG, "APPROTECT is in erased state (protected on nRF52840)");
-                ESP_LOGI(TAG, "Consider using 'Disable APPROTECT' before flashing");
-            } else if (approtect == 0xFFFFFF5A) {
-                ESP_LOGI(TAG, "APPROTECT is disabled (good for flashing)");
-            } else {
-                ESP_LOGW(TAG, "APPROTECT has unexpected value: 0x%08lX", approtect);
-            }
-        }
-    }
-
-
-
-    ESP_LOGI(TAG, "=== SWD Connection Attempt Complete ===");
-    return ret;
-}
-
-// System health monitoring task
+// System health monitoring task - simplified to only monitor heap
 static void system_health_task(void *arg) {
-    ESP_LOGI(TAG, "System health task started");
-    
-    system_health_t health;
-    
-    // Do initial system check
-    power_get_health_status(&health);
-    ESP_LOGI(TAG, "Initial Health: SWD=%d Flash=%d Net=%d",
-            health.swd_failures, health.flash_failures,
-            health.network_failures);
-    
+    ESP_LOGI(TAG, "System health monitoring started");
+
     size_t free_heap = esp_get_free_heap_size();
-    ESP_LOGI(TAG, "Heap: free=%d", free_heap);
-    
-    // Now just monitor for critical issues
+    ESP_LOGI(TAG, "Initial free heap: %d bytes", free_heap);
+
+    // Monitor heap every 5 seconds
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));  // Check every 5 seconds
-        
-        // Only check for critical heap issues
+        vTaskDelay(pdMS_TO_TICKS(5000));
+
         free_heap = esp_get_free_heap_size();
+
+        // Only log if memory is getting low
         if (free_heap < 20000) {
-            ESP_LOGW(TAG, "Low memory warning: %d bytes", free_heap);
+            ESP_LOGW(TAG, "Low memory warning: %d bytes free", free_heap);
+        }
+
+        // Log periodically even if OK (every minute)
+        static int check_count = 0;
+        check_count++;
+        if (check_count >= 12) {  // 12 * 5 seconds = 60 seconds
+            ESP_LOGI(TAG, "Heap: %d bytes free", free_heap);
+            check_count = 0;
         }
     }
 }
@@ -1138,8 +910,6 @@ static void init_system(void) {
     }
     ESP_ERROR_CHECK(ret);
     ESP_LOGI(TAG, "NVS Flash initialized");
-
-    system_events = xEventGroupCreate();
 
     power_config_t power_cfg = {
         .target_power_gpio = TARGET_POWER_GPIO,

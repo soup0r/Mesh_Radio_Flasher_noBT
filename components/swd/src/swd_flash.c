@@ -190,20 +190,6 @@ cleanup:
     return ret;
 }
 
-// Optimized single word write
-static esp_err_t swd_flash_write_word(uint32_t addr, uint32_t data) {
-    if (addr & 0x3) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    esp_err_t ret = set_nvmc_config(NVMC_CONFIG_WEN);
-    if (ret != ESP_OK) return ret;
-    
-    ret = swd_mem_write32(addr, data);
-    
-    set_nvmc_config(NVMC_CONFIG_REN);
-    return ret;
-}
 
 // Fast flash write with proper alignment handling
 esp_err_t swd_flash_write_buffer(uint32_t addr, const uint8_t *data, uint32_t size) {

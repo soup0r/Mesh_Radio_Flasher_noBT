@@ -6,18 +6,16 @@
 #include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "nvs.h"
-#include "esp_err.h"  // Explicitly include for esp_err_to_name()
+#include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
-#include "esp_task_wdt.h"
 
 static const char *TAG = "POWER_MGMT";
 static power_config_t power_config = {0};
-static system_health_t health_stats = {0};
 static bool power_state = true;
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
 static adc_cali_handle_t adc_cali_handle = NULL;
@@ -33,16 +31,13 @@ RTC_DATA_ATTR static uint64_t rtc_last_sleep_us = 0;
 RTC_DATA_ATTR static bool rtc_nrf_power_off_active = false;
 
 // Absolute uptime timer (scheduled maintenance reboot)
-RTC_DATA_ATTR static uint64_t rtc_boot_timestamp_sec = 0;         // First boot time (for reference)
-RTC_DATA_ATTR static uint64_t rtc_accumulated_awake_sec = 0;      // Total accumulated awake time
-RTC_DATA_ATTR static uint64_t rtc_last_awake_check_sec = 0;       // Last time counter was updated
-
-// Regular variables for WiFi/sleep management
-static uint32_t wake_count = 0;
+RTC_DATA_ATTR static uint64_t rtc_boot_timestamp_sec = 0;
+RTC_DATA_ATTR static uint64_t rtc_accumulated_awake_sec = 0;
+RTC_DATA_ATTR static uint64_t rtc_last_awake_check_sec = 0;
 
 // WiFi connection tracking
 static bool wifi_is_lr_mode = false;
-static char wifi_current_ssid[33] = {0};  // Max SSID length is 32 + null terminator
+static char wifi_current_ssid[33] = {0};
 
 #define VOLTAGE_DIVIDER_RATIO 2.0f
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_2
@@ -51,9 +46,6 @@ static char wifi_current_ssid[33] = {0};  // Max SSID length is 32 + null termin
 #define BATTERY_CRITICAL_VOLTAGE 3.2f
 #define BATTERY_LOW_VOLTAGE 3.5f
 #define ADC_SAMPLES_COUNT 10
-
-// Hardware watchdog timeout (must be fed regularly or device reboots)
-#define HARDWARE_WATCHDOG_TIMEOUT_SEC 60  // 60 seconds
 
 esp_err_t power_battery_init(void) {
     ESP_LOGI(TAG, "Initializing battery monitoring on GPIO2");
@@ -168,53 +160,40 @@ esp_err_t power_mgmt_init(const power_config_t *config) {
     }
     power_config = *config;
 
-    // CRITICAL: For default-ON hardware, explicitly take control ASAP
-    // During boot, GPIO was high-Z → nRF52 was ON for ~100-500ms
-    // We need to decide: keep it ON or turn it OFF?
-
     esp_reset_reason_t reset_reason = esp_reset_reason();
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
 
-    // Check if this is a wake from deep sleep or a fresh boot
     bool is_wake_from_sleep = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER);
 
     if (power_config.target_power_gpio >= 0) {
         gpio_num_t gpio = (gpio_num_t)power_config.target_power_gpio;
 
-        // Disable any existing hold from previous sleep
         gpio_hold_dis(gpio);
         gpio_deep_sleep_hold_dis();
 
-        // Configure GPIO
         gpio_reset_pin(gpio);
         gpio_set_direction(gpio, GPIO_MODE_OUTPUT);
 
-        // Set initial state based on boot type
         if (is_wake_from_sleep) {
-            // Waking from sleep - restore previous state from RTC memory
             ESP_LOGI(TAG, "Wake from sleep, restoring power state: %s",
                     rtc_nrf_power_state ? "ON" : "OFF");
 
             if (rtc_nrf_power_state) {
-                gpio_set_level(gpio, 0);  // ON
+                gpio_set_level(gpio, 0);
                 power_state = true;
             } else {
-                gpio_set_level(gpio, 1);  // OFF
+                gpio_set_level(gpio, 1);
                 power_state = false;
             }
         } else {
-            // Fresh boot (power-on, reset, brownout, etc.)
-            // Default: Turn ON (matches default-ON hardware behavior during boot)
             ESP_LOGI(TAG, "Fresh boot (reset reason: %d), setting power ON", reset_reason);
-            gpio_set_level(gpio, 0);  // ON
+            gpio_set_level(gpio, 0);
             power_state = true;
             rtc_nrf_power_state = true;
         }
 
-        // Wait for GPIO to settle after initial configuration
         vTaskDelay(pdMS_TO_TICKS(5));
 
-        // Verify and log
         int actual_level = gpio_get_level(gpio);
         ESP_LOGI(TAG, "Power control GPIO%d initialized: software=%s, physical=%d %s",
                 power_config.target_power_gpio,
@@ -222,7 +201,6 @@ esp_err_t power_mgmt_init(const power_config_t *config) {
                 actual_level,
                 (actual_level == (power_state ? 0 : 1)) ? "(verified)" : "(mismatch!)");
 
-        // Enable hold for deep sleep persistence
         gpio_hold_en(gpio);
     }
 
@@ -235,22 +213,14 @@ esp_err_t power_target_on(void) {
     if (power_config.target_power_gpio >= 0) {
         gpio_num_t gpio = (gpio_num_t)power_config.target_power_gpio;
 
-        // Disable hold if it was enabled during sleep
         gpio_hold_dis(gpio);
-
-        // Set GPIO to ON state (LOW for default-ON hardware)
         gpio_set_level(gpio, 0);
+        vTaskDelay(pdMS_TO_TICKS(5));
 
-        // CRITICAL: Wait for GPIO to settle before any readback
-        // Default-ON MOSFET gate needs time to discharge through pull resistor
-        vTaskDelay(pdMS_TO_TICKS(5));  // 5ms GPIO settling time
-
-        // Now wait for nRF52 power-on sequence
         if (power_config.power_on_delay_ms > 5) {
             vTaskDelay(pdMS_TO_TICKS(power_config.power_on_delay_ms - 5));
         }
 
-        // Verify GPIO state (after settling delay)
         int actual_level = gpio_get_level(gpio);
         if (actual_level != 0) {
             ESP_LOGW(TAG, "Power ON: GPIO%d readback mismatch (expected 0, got %d)",
@@ -260,11 +230,8 @@ esp_err_t power_target_on(void) {
             ESP_LOGI(TAG, "Power ON: GPIO%d = LOW (verified)", power_config.target_power_gpio);
         }
 
-        // Update software state (always trust this over physical read)
         power_state = true;
         rtc_nrf_power_state = true;
-
-        // Re-enable hold for next sleep
         gpio_hold_en(gpio);
 
         return ESP_OK;
@@ -276,20 +243,11 @@ esp_err_t power_target_off(void) {
     if (power_config.target_power_gpio >= 0) {
         gpio_num_t gpio = (gpio_num_t)power_config.target_power_gpio;
 
-        // Disable hold if it was enabled during sleep
         gpio_hold_dis(gpio);
-
-        // Set GPIO to OFF state (HIGH for default-ON hardware)
         gpio_set_level(gpio, 1);
-
-        // CRITICAL: Wait for GPIO to settle before any readback
-        // Default-ON MOSFET gate needs time to charge through ESP32 drive
-        vTaskDelay(pdMS_TO_TICKS(5));  // 5ms GPIO settling time
-
-        // Additional delay for clean power-down
+        vTaskDelay(pdMS_TO_TICKS(5));
         vTaskDelay(pdMS_TO_TICKS(100));
 
-        // Verify GPIO state (after settling delay)
         int actual_level = gpio_get_level(gpio);
         if (actual_level != 1) {
             ESP_LOGW(TAG, "Power OFF: GPIO%d readback mismatch (expected 1, got %d)",
@@ -299,11 +257,8 @@ esp_err_t power_target_off(void) {
             ESP_LOGI(TAG, "Power OFF: GPIO%d = HIGH (verified)", power_config.target_power_gpio);
         }
 
-        // Update software state (always trust this over physical read)
         power_state = false;
         rtc_nrf_power_state = false;
-
-        // Re-enable hold for next sleep
         gpio_hold_en(gpio);
 
         return ESP_OK;
@@ -318,22 +273,18 @@ esp_err_t power_target_reset(void) {
 
     ESP_LOGI(TAG, "Target reset: turning OFF for 15 seconds, then ON");
 
-    // Turn off
     esp_err_t ret = power_target_off();
     if (ret != ESP_OK) {
         return ret;
     }
 
-    // Wait 15 seconds
     vTaskDelay(pdMS_TO_TICKS(15000));
 
-    // Turn back on
     ret = power_target_on();
     if (ret != ESP_OK) {
         return ret;
     }
 
-    // Wait for power on delay
     vTaskDelay(pdMS_TO_TICKS(power_config.power_on_delay_ms));
 
     ESP_LOGI(TAG, "Target reset complete");
@@ -354,56 +305,28 @@ esp_err_t power_target_cycle(uint32_t off_time_ms) {
 }
 
 bool power_target_is_on(void) {
-    // Trust the internal state variable instead of reading GPIO
-    // (GPIO readback might be unreliable with certain hardware configurations)
     return power_state;
 }
 
 void power_prepare_for_sleep(void) {
-    // CRITICAL: Ensure GPIO hold is enabled before sleep
-    // This prevents default-ON hardware from turning nRF52 back ON during sleep
     if (power_config.target_power_gpio >= 0) {
         gpio_num_t gpio = (gpio_num_t)power_config.target_power_gpio;
 
-        // Make sure the current state is what we want
-        // (already should be set by power_target_on/off, but double-check)
         if (power_state) {
-            gpio_set_level(gpio, 0);  // ON
+            gpio_set_level(gpio, 0);
             ESP_LOGI(TAG, "Pre-sleep: nRF52 will stay ON during sleep (hold enabled)");
         } else {
-            gpio_set_level(gpio, 1);  // OFF
+            gpio_set_level(gpio, 1);
             ESP_LOGI(TAG, "Pre-sleep: nRF52 will stay OFF during sleep (hold enabled)");
         }
 
-        // Wait for settling
         vTaskDelay(pdMS_TO_TICKS(2));
-
-        // Enable hold on this specific GPIO
         gpio_hold_en(gpio);
-
-        // Enable global deep sleep hold
         gpio_deep_sleep_hold_en();
 
-        // Verify hold is enabled
         int level_before_sleep = gpio_get_level(gpio);
         ESP_LOGI(TAG, "GPIO%d level before sleep: %d (hold enabled)",
                 power_config.target_power_gpio, level_before_sleep);
-    }
-}
-
-void power_restore_after_sleep(void) {
-    if (power_config.target_power_gpio >= 0) {
-        ESP_LOGI(TAG, "Restored after deep sleep, power state: %s",
-                power_state ? "ON" : "OFF");
-    }
-}
-
-void power_watchdog_feed(void) {}
-
-void power_get_health_status(system_health_t *health) {
-    if (health) {
-        *health = health_stats;
-        health_stats.uptime_seconds++;
     }
 }
 
@@ -421,8 +344,6 @@ wake_reason_t power_get_wake_reason(void) {
     }
 }
 
-
-// WiFi connection info functions
 void power_set_wifi_info(bool is_lr, const char* ssid) {
     wifi_is_lr_mode = is_lr;
     if (ssid) {
@@ -439,8 +360,6 @@ const char* power_get_wifi_ssid(void) {
     return wifi_current_ssid;
 }
 
-
-// Function to calculate deep sleep duration based on battery level
 uint64_t calculate_sleep_duration_us(float battery_voltage) {
     uint32_t sleep_seconds;
 
@@ -465,37 +384,6 @@ uint64_t calculate_sleep_duration_us(float battery_voltage) {
     return sleep_seconds * 1000000ULL;
 }
 
-// =============================================================================
-// 24-HOUR ABSOLUTE TIMER IMPLEMENTATION
-// =============================================================================
-
-/**
- * @brief Check and enforce 24-hour absolute reboot timer
- *
- * This function MUST be called at every boot/wake before any other operations.
- * It tracks total uptime across sleep/wake cycles using RTC memory.
- * After 24 hours of accumulated uptime, it forces a reboot.
- *
- * This is the ultimate safety mechanism - ensures device reboots every 24 hours
- * regardless of WiFi status, sleep cycles, or any other conditions.
- *
- * @return ESP_OK if within time limit, never returns if time exceeded (reboots)
- */
-/**
- * @brief Check absolute uptime timer and reboot if exceeded
- *
- * This function tracks total accumulated uptime across all wake/sleep cycles
- * and forces a reboot after the configured interval. This ensures the device
- * reboots periodically for maintenance even if WiFi stays connected indefinitely.
- *
- * The timer only counts AWAKE time - sleep time is not accumulated.
- *
- * Should be called:
- * 1. At boot (in app_main, before any heavy operations)
- * 2. Periodically during active mode (every 10-60 seconds)
- *
- * @return ESP_OK if timer OK, never returns if reboot triggered
- */
 esp_err_t power_check_absolute_timer(void) {
     if (!power_config.enable_absolute_timer) {
         return ESP_OK;
@@ -503,7 +391,6 @@ esp_err_t power_check_absolute_timer(void) {
 
     uint64_t current_time_sec = esp_timer_get_time() / 1000000ULL;
 
-    // Initialize on first boot
     if (rtc_boot_timestamp_sec == 0) {
         rtc_boot_timestamp_sec = current_time_sec;
         rtc_accumulated_awake_sec = 0;
@@ -524,7 +411,6 @@ esp_err_t power_check_absolute_timer(void) {
         return ESP_OK;
     }
 
-    // Update accumulated awake time since last check
     if (current_time_sec > rtc_last_awake_check_sec) {
         uint64_t awake_this_period = current_time_sec - rtc_last_awake_check_sec;
         rtc_accumulated_awake_sec += awake_this_period;
@@ -536,7 +422,6 @@ esp_err_t power_check_absolute_timer(void) {
                 power_config.absolute_reboot_interval_sec);
     }
 
-    // Check if threshold exceeded
     if (rtc_accumulated_awake_sec >= power_config.absolute_reboot_interval_sec) {
         uint64_t total_runtime_sec = current_time_sec - rtc_boot_timestamp_sec;
         uint64_t total_runtime_min = total_runtime_sec / 60;
@@ -583,30 +468,18 @@ esp_err_t power_check_absolute_timer(void) {
         ESP_LOGW(TAG, "╚════════════════════════════════════════════════════════════╝");
         ESP_LOGW(TAG, "");
 
-        // Small delay for logs to flush
         vTaskDelay(pdMS_TO_TICKS(1000));
 
-        // Reset the timer and reboot
         rtc_boot_timestamp_sec = 0;
         rtc_accumulated_awake_sec = 0;
         rtc_last_awake_check_sec = 0;
 
-        // Trigger reboot
         esp_restart();
-        // Never returns
     }
 
     return ESP_OK;
 }
 
-/**
- * @brief Get current absolute timer status
- *
- * @param[out] accumulated_sec Total accumulated awake time in seconds
- * @param[out] limit_sec Configured limit in seconds
- * @param[out] remaining_sec Time remaining before reboot (0 if exceeded)
- * @return ESP_OK if timer enabled, ESP_ERR_INVALID_STATE if disabled
- */
 esp_err_t power_get_absolute_timer_status(uint64_t *accumulated_sec, uint64_t *limit_sec, uint64_t *remaining_sec) {
     if (!power_config.enable_absolute_timer) {
         return ESP_ERR_INVALID_STATE;
@@ -631,138 +504,53 @@ esp_err_t power_get_absolute_timer_status(uint64_t *accumulated_sec, uint64_t *l
     return ESP_OK;
 }
 
-/**
- * @brief Reset the absolute uptime timer (for testing or maintenance mode)
- *
- * WARNING: Use only for testing. In production, let timer run normally.
- */
-void power_reset_absolute_timer(void) {
-    ESP_LOGW(TAG, "Manually resetting absolute uptime timer");
-    rtc_boot_timestamp_sec = 0;
-    rtc_accumulated_awake_sec = 0;
-    rtc_last_awake_check_sec = 0;
-}
-
-// =============================================================================
-// HARDWARE WATCHDOG IMPLEMENTATION
-// =============================================================================
-
-/**
- * @brief Initialize hardware watchdog timer
- *
- * The hardware watchdog must be fed every 60 seconds or the device will reboot.
- * This catches complete hangs where the entire system becomes unresponsive.
- *
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t power_init_hardware_watchdog(void) {
-    ESP_LOGI(TAG, "Initializing hardware watchdog (%d second timeout)",
-            HARDWARE_WATCHDOG_TIMEOUT_SEC);
-
-    // Configure watchdog
-    esp_task_wdt_config_t wdt_config = {
-        .timeout_ms = HARDWARE_WATCHDOG_TIMEOUT_SEC * 1000,
-        .idle_core_mask = 0,        // Don't watch idle task
-        .trigger_panic = false      // Just reboot, don't panic
-    };
-
-    esp_err_t ret = esp_task_wdt_init(&wdt_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to init hardware watchdog: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // Subscribe current task (main task)
-    ret = esp_task_wdt_add(NULL);  // NULL = current task
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add task to watchdog: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGW(TAG, "⚠️  Hardware watchdog active - must feed every %d seconds or device reboots",
-            HARDWARE_WATCHDOG_TIMEOUT_SEC);
-
-    return ESP_OK;
-}
-
-/**
- * @brief Feed the hardware watchdog
- *
- * This function MUST be called regularly (at least every 60 seconds)
- * to prevent the hardware watchdog from triggering a reboot.
- *
- * Call this in your main monitoring loop.
- */
-void power_feed_watchdog(void) {
-    esp_task_wdt_reset();
-}
-
-// Enhanced deep sleep function for ESP32-C3 with proper timing
 esp_err_t power_enter_adaptive_deep_sleep(void) {
     if (!ENABLE_DEEP_SLEEP_POWER_MGMT) {
         ESP_LOGI(TAG, "Deep sleep disabled in config");
         return ESP_OK;
     }
 
-    // Get current battery voltage
     battery_status_t battery;
     power_get_battery_status(&battery);
     float voltage = battery.voltage;
 
-    // Increment for next wake with overflow protection
-    wake_count++;
-    if (wake_count > 1000) {  // Arbitrary safety limit
+    rtc_wake_count++;
+    if (rtc_wake_count > 1000) {
         ESP_LOGW(TAG, "Wake count overflow protection - resetting to 0");
-        wake_count = 0;
+        rtc_wake_count = 0;
     }
 
-    ESP_LOGI(TAG, "Entering deep sleep (this will be wake #%lu)", wake_count);
+    ESP_LOGI(TAG, "Entering deep sleep (this will be wake #%lu)", rtc_wake_count);
 
-    // Store values in RTC memory
     rtc_last_battery_voltage = voltage;
-    rtc_wake_count = wake_count;
 
-    // Calculate sleep duration
     uint64_t sleep_duration_us = calculate_sleep_duration_us(voltage);
-
-    // Store sleep duration for accurate timing after wake
     rtc_last_sleep_us = sleep_duration_us;
 
-    // Handle critical voltage - power off nRF52
     if (voltage < NRF52_POWER_OFF_VOLTAGE && ENABLE_BATTERY_PROTECTION) {
         ESP_LOGW(TAG, "Battery voltage %.2fV below threshold %.2fV - powering off nRF52",
                 voltage, NRF52_POWER_OFF_VOLTAGE);
         power_target_off();
         rtc_nrf_power_state = false;
 
-        // Mark that we're starting/continuing power-off period
         if (!rtc_nrf_power_off_active) {
             rtc_nrf_power_off_active = true;
-            rtc_nrf_off_total_ms = 0;  // Reset the timer
+            rtc_nrf_off_total_ms = 0;
             ESP_LOGI(TAG, "Starting nRF52 power-off period");
         }
     } else {
-        // Store current power state in RTC memory
         rtc_nrf_power_state = power_state;
     }
 
-    // Configure GPIO to maintain state during deep sleep
     if (power_config.target_power_gpio >= 0) {
         gpio_num_t power_gpio = (gpio_num_t)power_config.target_power_gpio;
 
         ESP_LOGI(TAG, "Configuring GPIO%d to hold state %s during deep sleep",
                 power_gpio, power_state ? "ON (LOW)" : "OFF (HIGH)");
 
-        // DON'T reset the pin - just ensure it's configured correctly
-        // gpio_reset_pin() would momentarily make it an input!
-
-        // Make sure direction is output (if not already)
         gpio_set_direction(power_gpio, GPIO_MODE_OUTPUT);
-
-        // Set the desired level
         gpio_set_level(power_gpio, power_state ? 0 : 1);
 
-        // Enable hold on this GPIO
         esp_err_t ret = gpio_hold_en(power_gpio);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to enable hold on GPIO%d: %s",
@@ -772,34 +560,27 @@ esp_err_t power_enter_adaptive_deep_sleep(void) {
         }
     }
 
-    // Enable deep sleep hold for all held GPIOs
     gpio_deep_sleep_hold_en();
 
     ESP_LOGI(TAG, "Entering deep sleep for %llu seconds (wake count: %lu)",
-            sleep_duration_us / 1000000ULL, wake_count);
+            sleep_duration_us / 1000000ULL, rtc_wake_count);
     ESP_LOGI(TAG, "DEBUG: Timer microseconds = %llu", sleep_duration_us);
 
     if (rtc_nrf_power_off_active) {
         ESP_LOGI(TAG, "nRF52 has been off for %llu ms total", rtc_nrf_off_total_ms);
     }
 
-    // Configure wake up timer
     esp_sleep_enable_timer_wakeup(sleep_duration_us);
     ESP_LOGI(TAG, "DEBUG: Timer configured, entering sleep NOW");
 
-    // Enter deep sleep
     esp_deep_sleep_start();
-
-    // Never reaches here
     return ESP_OK;
 }
 
-// Function to restore state after wake from deep sleep (with proper glitch prevention)
 esp_err_t power_restore_from_deep_sleep(void) {
     esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
 
     if (wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
-        // Fresh boot, not waking from sleep
         ESP_LOGI(TAG, "Fresh boot detected - initializing RTC variables");
         rtc_wake_count = 0;
         rtc_nrf_power_state = true;
@@ -821,7 +602,6 @@ esp_err_t power_restore_from_deep_sleep(void) {
     ESP_LOGI(TAG, "DEBUG: Configured sleep was %llu us", rtc_last_sleep_us);
     ESP_LOGI(TAG, "NRF52 state in RTC: %s", rtc_nrf_power_state ? "ON" : "OFF");
 
-    // Resume absolute timer tracking - we were asleep, now awake again
     uint64_t current_time_sec = esp_timer_get_time() / 1000000ULL;
     if (rtc_last_awake_check_sec == 0) {
         rtc_last_awake_check_sec = current_time_sec;
@@ -834,28 +614,19 @@ esp_err_t power_restore_from_deep_sleep(void) {
                 accumulated_min, limit_min);
     }
 
-    // Update accumulated off time if nRF52 was powered off
     if (rtc_nrf_power_off_active) {
         rtc_nrf_off_total_ms += rtc_last_sleep_us / 1000ULL;
         ESP_LOGI(TAG, "nRF52 total off time: %llu ms (%llu hours)",
                 rtc_nrf_off_total_ms, rtc_nrf_off_total_ms / 3600000ULL);
     }
 
-    // Restore wake count from RTC memory
-    wake_count = rtc_wake_count;
-
-    // IMPORTANT: Configure GPIO BEFORE releasing hold to prevent glitches
     if (power_config.target_power_gpio >= 0) {
         gpio_num_t power_gpio = (gpio_num_t)power_config.target_power_gpio;
-
-        // Restore power state from RTC memory
         power_state = rtc_nrf_power_state;
 
-        // Configure GPIO while hold is still active (prevents glitch)
         gpio_set_direction(power_gpio, GPIO_MODE_OUTPUT);
         gpio_set_level(power_gpio, power_state ? 0 : 1);
 
-        // NOW disable hold - pin will maintain the level we just set
         esp_err_t ret = gpio_hold_dis(power_gpio);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to disable hold on GPIO%d: %s",
@@ -866,10 +637,8 @@ esp_err_t power_restore_from_deep_sleep(void) {
                 power_gpio, power_state ? "ON (LOW)" : "OFF (HIGH)");
     }
 
-    // Disable global deep sleep hold after individual pins are handled
     gpio_deep_sleep_hold_dis();
 
-    // Check battery and manage nRF52 power
     battery_status_t battery;
     power_get_battery_status(&battery);
 
@@ -878,38 +647,23 @@ esp_err_t power_restore_from_deep_sleep(void) {
             power_state ? "ON" : "OFF",
             rtc_nrf_power_off_active ? "YES" : "NO");
 
-    // =========================================================================
-    // NRF52 Power Management Logic
-    // All thresholds configured in config.h
-    // =========================================================================
-
-    // CASE 1: Battery is LOW - turn OFF or keep OFF
     if (battery.voltage < NRF52_POWER_OFF_VOLTAGE && ENABLE_BATTERY_PROTECTION) {
-
         if (power_state) {
-            // Currently ON but battery is low - turn OFF
             ESP_LOGW(TAG, "Battery low (%.2fV < %.2fV) - turning nRF52 OFF",
                     battery.voltage, NRF52_POWER_OFF_VOLTAGE);
             power_target_off();
             rtc_nrf_power_state = false;
 
-            // Start power-off protection period
             if (!rtc_nrf_power_off_active) {
                 rtc_nrf_power_off_active = true;
                 rtc_nrf_off_total_ms = 0;
                 ESP_LOGI(TAG, "Starting nRF52 power-off protection period");
             }
         } else {
-            // Already OFF - keep it off
             ESP_LOGI(TAG, "Battery still low (%.2fV) - keeping nRF52 OFF (off for %llu ms)",
                     battery.voltage, rtc_nrf_off_total_ms);
         }
-    }
-
-    // CASE 2: Battery has RECOVERED - decide whether to turn ON
-    else if (rtc_nrf_power_off_active && !power_state) {
-        // We're in protection mode and NRF52 is OFF
-
+    } else if (rtc_nrf_power_off_active && !power_state) {
         float turn_on_threshold = NRF52_POWER_OFF_VOLTAGE + NRF52_POWER_ON_HYSTERESIS;
         uint32_t min_off_time_ms = NRF52_MIN_OFF_TIME_SEC * 1000UL;
         uint32_t max_off_time_ms = NRF52_MAX_OFF_TIME_SEC * 1000UL;
@@ -926,10 +680,7 @@ esp_err_t power_restore_from_deep_sleep(void) {
         ESP_LOGI(TAG, "  Max time: %llu/%lu ms %s",
                 rtc_nrf_off_total_ms, max_off_time_ms, max_time_exceeded ? "(exceeded)" : "");
 
-        // Turn ON if:
-        // (Battery is good AND minimum time elapsed) OR maximum time exceeded
         if ((voltage_good && min_time_elapsed) || max_time_exceeded) {
-
             if (max_time_exceeded && !voltage_good) {
                 ESP_LOGW(TAG, "Maximum off time (%lu sec) exceeded - attempting turn-on despite marginal voltage",
                         NRF52_MAX_OFF_TIME_SEC);
@@ -939,14 +690,11 @@ esp_err_t power_restore_from_deep_sleep(void) {
             power_target_on();
             rtc_nrf_power_state = true;
 
-            // Exit protection mode
             rtc_nrf_power_off_active = false;
             rtc_nrf_off_total_ms = 0;
 
             ESP_LOGI(TAG, "nRF52 power protection period ended");
-
         } else {
-            // Not ready to turn on yet
             ESP_LOGI(TAG, "Keeping nRF52 OFF - conditions not met");
 
             if (!voltage_good) {
@@ -960,20 +708,12 @@ esp_err_t power_restore_from_deep_sleep(void) {
                         remaining_ms / 1000);
             }
         }
-    }
-
-    // CASE 3: Battery is GOOD and not in protection mode
-    else if (battery.voltage >= NRF52_POWER_OFF_VOLTAGE && !power_state) {
-        // Battery is good but NRF52 is off (not in protection mode)
-        // This can happen after a manual power off or other edge cases
+    } else if (battery.voltage >= NRF52_POWER_OFF_VOLTAGE && !power_state) {
         ESP_LOGI(TAG, "Battery good (%.2fV) and NRF52 is OFF - turning ON",
                 battery.voltage);
         power_target_on();
         rtc_nrf_power_state = true;
-    }
-
-    // CASE 4: Everything is normal
-    else if (power_state) {
+    } else if (power_state) {
         ESP_LOGI(TAG, "NRF52 ON, battery sufficient (%.2fV)", battery.voltage);
     }
 
@@ -981,13 +721,6 @@ esp_err_t power_restore_from_deep_sleep(void) {
     return ESP_OK;
 }
 
-
-// Helper functions
 uint32_t power_get_wake_count(void) {
-    return wake_count;
-}
-
-void power_reset_wake_count(void) {
-    wake_count = 0;
-    rtc_wake_count = 0;
+    return rtc_wake_count;
 }

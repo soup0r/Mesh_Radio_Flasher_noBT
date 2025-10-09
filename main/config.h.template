@@ -43,18 +43,14 @@
 // WiFi Resilience Settings
 // =============================================================================
 
-// Connection stability parameters
-#define WIFI_BEACON_TIMEOUT_ENABLE true         // Enable extended beacon timeout
-#define WIFI_BEACON_TIMEOUT 30                  // Seconds before considering AP lost
-#define WIFI_SCAN_RSSI_THRESHOLD -85            // Minimum RSSI to attempt connection (dBm)
-
-// Power management trade-offs
-#define WIFI_PS_MODE WIFI_PS_NONE               // NONE=stable, MIN_MODEM=power save
-#define WIFI_ENABLE_11B_RATE true               // Use 802.11b rates for better range
-
-// Mode-specific notes:
-// ESP-LR: Fixed 250 Kbps, max power, power save must be NONE, 2-4x range
-// Normal: Variable rates, configurable power, can use power save, standard range
+// WiFi resilience settings are now configured in sdkconfig.defaults:
+// - Extended beacon timeout: 10 seconds (CONFIG_ESP_WIFI_STA_BEACON_TIMEOUT)
+// - Power save disabled for stability (CONFIG_ESP_WIFI_PS_NONE)
+// - 802.11b support enabled (CONFIG_ESP_WIFI_11B_SUPPORT)
+// - Increased TX/RX buffers for better reliability
+//
+// These settings apply automatically to both ESP-LR and normal WiFi modes.
+// No configuration defines needed here - all handled by ESP-IDF build system.
 
 // =============================================================================
 // Hardware Configuration
@@ -196,19 +192,9 @@
 // =============================================================================
 // GPIO Settling Time (for default-ON MOSFET hardware)
 // =============================================================================
-// Time to wait after GPIO state change before considering it stable.
-// Default-ON MOSFET hardware has external pull resistor that fights GPIO
-// during transitions, requiring settling time before reliable readback.
-//
-// Typical values:
-// - Small gate capacitance + weak pull: 2-5ms
-// - Large gate capacitance + strong pull: 5-10ms
-// - If you see "readback mismatch" warnings: increase this
-//
-// Note: This is separate from nRF52 power-on delay.
-// GPIO settling happens first, then power-on sequence.
-
-#define GPIO_SETTLING_DELAY_MS 5  // Milliseconds to wait after GPIO change
+// GPIO settling delay is now hardcoded in power_mgmt.c - no define needed here.
+// Time to wait after GPIO state change is handled automatically by the power
+// management system for reliable hardware control.
 
 // =============================================================================
 // Feature Flags
@@ -216,13 +202,13 @@
 
 #define ENABLE_DEEP_SLEEP_POWER_MGMT true       // Master switch for sleep functionality
 #define ENABLE_BATTERY_PROTECTION true          // Enable low battery protection
-#define LOG_BATTERY_STATS true                  // Log battery info to console
+// Battery stats are logged automatically at DEBUG level - no flag needed
 
 // =============================================================================
 // Device Information
 // =============================================================================
 
-#define DEVICE_NAME "Mesh Radio Flasher"
 #define DEVICE_VERSION "1.0.0"
+// Device name is displayed in web interface HTML, not defined here
 
 #endif // CONFIG_H
